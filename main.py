@@ -229,6 +229,7 @@ async def cleanup_duplicate_lingarr_translations():
     
     # Find duplicates and cancel newer ones
     cancelled_count = 0
+    removed_count = 0
     for key, translations in groups.items():
         if len(translations) <= 1:
             continue
@@ -236,19 +237,21 @@ async def cleanup_duplicate_lingarr_translations():
         # Sort by creation time (oldest first)
         translations.sort(key=lambda x: x.get("createdAt", ""))
         
-        # Keep the oldest, cancel the rest
+        # Keep the oldest, cancel and remove the rest
         oldest = translations[0]
         duplicates = translations[1:]
         
         logger.info(f"Found {len(duplicates)} duplicate translation(s) for {oldest.get('title', 'Unknown')} ({oldest.get('targetLanguage', '')})")
         
         for dup in duplicates:
-            logger.info(f"  Cancelling duplicate translation ID {dup.get('id')} (created at {dup.get('createdAt')})")
+            logger.info(f"  Cancelling and removing duplicate translation ID {dup.get('id')} (created at {dup.get('createdAt')})")
             if await cancel_lingarr_translation(dup):
                 cancelled_count += 1
+            if await remove_lingarr_translation(dup):
+                removed_count += 1
     
     if cancelled_count > 0:
-        logger.info(f"Cancelled {cancelled_count} duplicate translation request(s) in Lingarr")
+        logger.info(f"Cancelled {cancelled_count} and removed {removed_count} duplicate translation request(s) in Lingarr")
 
 async def lingarr_cleanup_loop():
     """Background loop that periodically checks and cancels duplicate translations in Lingarr."""
@@ -605,6 +608,115 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate], priority
     if skipped_count > 0:
         logger.debug(f"Skipped {skipped_count} subtitles already in system")
 
+async def find_lingarr_media_id(subtitle_path: str, media_type: str, client: httpx.AsyncClient) -> Optional[int]:
+    """
+    Find the Lingarr media ID for a given subtitle path.
+    Returns the Lingarr internal media ID or None if not found.
+    """
+    try:
+        # Get subtitles for this path from Lingarr
+        response = await client.post(
+            f"{lingarr_url}/api/Subtitle/all",
+            json={"path": subtitle_path}
+        )
+        response.raise_for_status()
+        subtitles = response.json()
+        
+        if not subtitles or len(subtitles) == 0:
+            return None
+        
+        # Extract the directory path (parent of subtitle file)
+        import os
+        media_dir = os.path.dirname(subtitle_path)
+        
+        # Search for the media in Lingarr's database by path
+        if media_type == "Episode":
+            # For shows, we need to find by the show path
+            response = await client.get(
+                f"{lingarr_url}/api/Media/shows",
+                params={"searchQuery": media_dir, "pageSize": 100}
+            )
+        else:  # Movie
+            response = await client.get(
+                f"{lingarr_url}/api/Media/movies",
+                params={"searchQuery": media_dir, "pageSize": 100}
+            )
+        
+        response.raise_for_status()
+        data = response.json()
+        items = data.get("items", [])
+        
+        # Find media that matches the path
+        for item in items:
+            item_path = item.get("path", "")
+            if media_dir.startswith(item_path) or item_path in media_dir:
+                if media_type == "Episode":
+                    # For episodes, we need to find the specific episode
+                    # Return the sonarrId as mediaId for episodes
+                    return item.get("sonarrId")
+                else:
+                    # For movies, return the radarrId
+                    return item.get("radarrId")
+        
+        return None
+        
+    except Exception as e:
+        logger.debug(f"Failed to find Lingarr media ID for {subtitle_path}: {e}")
+        return None
+
+def translate_via_lingarr_sync(sub: SubtitleTranslate, client: httpx.Client) -> bool:
+    """
+    Translate subtitle directly via Lingarr API, bypassing Bazarr.
+    Synchronous wrapper for async function.
+    Returns True if successful, False otherwise.
+    """
+    import asyncio
+    
+    async def _translate():
+        async with httpx.AsyncClient(timeout=60.0) as async_client:
+            media_type = "Episode" if sub.is_serie else "Movie"
+            
+            # Try to find the media ID in Lingarr
+            lingarr_media_id = await find_lingarr_media_id(sub.base_subtitle.path, media_type, async_client)
+            
+            if lingarr_media_id is None:
+                raise Exception(f"Media not found in Lingarr database for path: {sub.base_subtitle.path}")
+            
+            # Prepare the request payload
+            payload = {
+                "mediaId": lingarr_media_id,
+                "subtitlePath": sub.base_subtitle.path,
+                "sourceLanguage": sub.base_subtitle.code2,
+                "targetLanguage": sub.to_language,
+                "mediaType": media_type,
+                "subtitleFormat": "srt"
+            }
+            
+            response = await async_client.post(
+                f"{lingarr_url}/api/Translate/subtitle",
+                json=payload
+            )
+            response.raise_for_status()
+            
+            # Response should contain jobId
+            data = response.json()
+            job_id = data.get("jobId")
+            
+            if job_id:
+                return True
+            else:
+                raise Exception("No jobId returned from Lingarr")
+    
+    # Run the async function in the current thread's event loop
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(_translate())
+        loop.close()
+        return result
+    except Exception as e:
+        raise e
+
 def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
     """Worker thread that processes translation requests from queue.
     
@@ -638,44 +750,67 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                 # Check if subtitle filename contains language code
                 filename = sub.base_subtitle.path
                 has_lang_code = f".{sub.base_subtitle.code2}." in filename.lower() or filename.lower().endswith(f".{sub.base_subtitle.code2}.srt")
-                if not has_lang_code:
-                    logger.warning(f"[{worker_label}] Subtitle file missing language code in filename: {filename}")
                 
-                logger.info(f"[{worker_label}] Translating: {sub.base_subtitle.path} ({sub.base_subtitle.code2} → {sub.to_language})")
-
-                # Execute translation
-                params = {
-                    "action": "translate",
-                    "language": sub.to_language,
-                    "path": sub.base_subtitle.path,
-                    "type": "episode" if sub.is_serie else "movie",
-                    "id": sub.video_id,
-                    "forced": sub.base_subtitle.forced,
-                    "hi": sub.base_subtitle.hi,
-                    "original_format": True,
-                }
+                # Decide whether to use Lingarr directly or go through Bazarr
+                use_lingarr_direct = not has_lang_code and lingarr_url
+                
+                if use_lingarr_direct:
+                    logger.info(f"[{worker_label}] Translating via Lingarr (missing language code): {sub.base_subtitle.path} ({sub.base_subtitle.code2} → {sub.to_language})")
+                else:
+                    if not has_lang_code:
+                        logger.warning(f"[{worker_label}] Subtitle file missing language code in filename: {filename}")
+                        logger.warning(f"[{worker_label}] This may cause Lingarr to misdetect source language. Consider renaming to include '.{sub.base_subtitle.code2}.' in filename")
+                    logger.info(f"[{worker_label}] Translating: {sub.base_subtitle.path} ({sub.base_subtitle.code2} → {sub.to_language})")
 
                 start_time = time.time()
-                response = client.patch(endpoint, headers=headers, params=params)
-                translation_time = time.time() - start_time
                 
-                # Log response for debugging
-                if response.status_code != 204:
-                    logger.warning(f"[{worker_label}] Unexpected status code: {response.status_code}")
+                if use_lingarr_direct:
+                    # Translate directly via Lingarr API
                     try:
-                        logger.debug(f"[{worker_label}] Response body: {response.text}")
-                    except:
-                        pass
+                        translate_via_lingarr_sync(sub, client)
+                        translation_time = time.time() - start_time
+                        logger.info(f"[{worker_label}] Translation submitted to Lingarr successfully ({translation_time:.1f}s)")
+                        qm.mark_completed(sub, success=True)
+                    except Exception as e:
+                        translation_time = time.time() - start_time
+                        logger.error(f"[{worker_label}] Failed to translate via Lingarr: {e}")
+                        logger.info(f"[{worker_label}] Falling back to Bazarr API")
+                        # Fall back to Bazarr
+                        use_lingarr_direct = False
                 
-                response.raise_for_status()
-                
-                # Check if translation completed suspiciously fast (likely failed)
-                if translation_time < min_translation_time:
-                    logger.warning(f"[{worker_label}] Translation completed too quickly ({translation_time:.1f}s < {min_translation_time}s) - marking as failed")
-                    qm.mark_completed(sub, success=False)  # This will retry or mark failed based on retry count
-                else:
-                    logger.info(f"[{worker_label}] Translation completed successfully ({translation_time:.1f}s)")
-                    qm.mark_completed(sub, success=True)
+                if not use_lingarr_direct:
+                    # Execute translation via Bazarr
+                    params = {
+                        "action": "translate",
+                        "language": sub.to_language,
+                        "path": sub.base_subtitle.path,
+                        "type": "episode" if sub.is_serie else "movie",
+                        "id": sub.video_id,
+                        "forced": sub.base_subtitle.forced,
+                        "hi": sub.base_subtitle.hi,
+                        "original_format": True,
+                    }
+
+                    response = client.patch(endpoint, headers=headers, params=params)
+                    translation_time = time.time() - start_time
+                    
+                    # Log response for debugging
+                    if response.status_code != 204:
+                        logger.warning(f"[{worker_label}] Unexpected status code: {response.status_code}")
+                        try:
+                            logger.debug(f"[{worker_label}] Response body: {response.text}")
+                        except:
+                            pass
+                    
+                    response.raise_for_status()
+                    
+                    # Check if translation completed suspiciously fast (likely failed)
+                    if translation_time < min_translation_time:
+                        logger.warning(f"[{worker_label}] Translation completed too quickly ({translation_time:.1f}s < {min_translation_time}s) - marking as failed")
+                        qm.mark_completed(sub, success=False)  # This will retry or mark failed based on retry count
+                    else:
+                        logger.info(f"[{worker_label}] Translation completed successfully ({translation_time:.1f}s)")
+                        qm.mark_completed(sub, success=True)
                     
             except httpx.HTTPStatusError as e:
                 logger.error(f"[{worker_label}] HTTP {e.response.status_code} error translating {sub.base_subtitle.path if sub else 'unknown'}: {e}")
