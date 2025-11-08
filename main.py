@@ -85,6 +85,14 @@ manual_scan_series_event = asyncio.Event()
 manual_scan_movies_event = asyncio.Event()
 logger = logging.getLogger("bazarr_lingarr")
 
+# Cache for Lingarr media lookups
+lingarr_media_cache = {
+    "movies": {},  # path -> radarrId
+    "shows": {},   # path -> sonarrId
+    "last_refresh": 0
+}
+lingarr_cache_ttl = 300  # Cache for 5 minutes
+
 async def get_lingarr_active_translations():
     """Get all active translation requests from Lingarr."""
     if not lingarr_url:
@@ -253,6 +261,78 @@ async def cleanup_duplicate_lingarr_translations():
     if cancelled_count > 0:
         logger.info(f"Cancelled {cancelled_count} and removed {removed_count} duplicate translation request(s) in Lingarr")
 
+async def sync_lingarr_status():
+    """Check Lingarr translation status and update our queue items accordingly."""
+    if not lingarr_url:
+        return
+    
+    try:
+        # Get all translation requests from Lingarr
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{lingarr_url}/api/TranslationRequest/requests",
+                params={"pageSize": 1000, "pageNumber": 1}
+            )
+            response.raise_for_status()
+            data = response.json()
+            lingarr_requests = data.get("items", [])
+        
+        if not lingarr_requests:
+            return
+        
+        # Create a lookup map: subtitle_path|target_lang -> status
+        lingarr_status_map = {}
+        for req in lingarr_requests:
+            subtitle_path = req.get("subtitleToTranslate", "")
+            target_lang = req.get("targetLanguage", "")
+            status = req.get("status", "")
+            key = f"{subtitle_path}|{target_lang}"
+            lingarr_status_map[key] = status
+        
+        # Check our queue items and update based on Lingarr status
+        qms = []
+        if dual_queue_mode:
+            if queue_manager_series:
+                qms.append(("series", queue_manager_series))
+            if queue_manager_movies:
+                qms.append(("movies", queue_manager_movies))
+        else:
+            if queue_manager:
+                qms.append(("combined", queue_manager))
+        
+        for queue_type, qm in qms:
+            # Check processing items
+            processing_items = list(qm.processing_keys)
+            for key in processing_items:
+                item = qm.items.get(key)
+                if not item:
+                    continue
+                
+                subtitle_path = item.get("base_subtitle", {}).get("path", "")
+                target_lang = item.get("to_language", "")
+                lookup_key = f"{subtitle_path}|{target_lang}"
+                
+                lingarr_status = lingarr_status_map.get(lookup_key)
+                
+                if lingarr_status == "Completed":
+                    logger.info(f"Lingarr completed translation for: {subtitle_path} -> {target_lang}")
+                    # Mark as completed in our queue
+                    sub = SubtitleTranslate(**item)
+                    qm.mark_completed(sub, success=True)
+                elif lingarr_status == "Failed":
+                    logger.warning(f"Lingarr failed translation for: {subtitle_path} -> {target_lang}")
+                    # Mark as failed in our queue (will retry or mark failed based on retry count)
+                    sub = SubtitleTranslate(**item)
+                    qm.mark_completed(sub, success=False)
+                elif lingarr_status == "Cancelled":
+                    logger.warning(f"Lingarr cancelled translation for: {subtitle_path} -> {target_lang}")
+                    # Mark as failed in our queue
+                    sub = SubtitleTranslate(**item)
+                    qm.mark_completed(sub, success=False)
+        
+    except Exception as e:
+        logger.debug(f"Error syncing Lingarr status: {e}")
+
 async def lingarr_cleanup_loop():
     """Background loop that periodically checks and cancels duplicate translations in Lingarr."""
     if not lingarr_url:
@@ -264,6 +344,7 @@ async def lingarr_cleanup_loop():
     while not shutdown_event.is_set():
         try:
             await cleanup_duplicate_lingarr_translations()
+            await sync_lingarr_status()
         except Exception as e:
             logger.error(f"Error in Lingarr cleanup loop: {e}")
         
@@ -608,56 +689,120 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate], priority
     if skipped_count > 0:
         logger.debug(f"Skipped {skipped_count} subtitles already in system")
 
+async def refresh_lingarr_media_cache(client: httpx.AsyncClient):
+    """Refresh the Lingarr media cache by fetching all movies and shows."""
+    import time
+    
+    current_time = time.time()
+    # Only refresh if cache is older than TTL
+    if current_time - lingarr_media_cache["last_refresh"] < lingarr_cache_ttl:
+        return
+    
+    logger.info("Refreshing Lingarr media cache...")
+    
+    try:
+        # Fetch all movies with pagination
+        movies = {}
+        page = 1
+        page_size = 100
+        
+        while True:
+            response = await client.get(
+                f"{lingarr_url}/api/Media/movies",
+                params={"pageSize": page_size, "pageNumber": page}
+            )
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("items", [])
+            
+            if not items:
+                break
+            
+            for item in items:
+                path = item.get("path", "")
+                radarr_id = item.get("radarrId")
+                if path and radarr_id:
+                    movies[path] = radarr_id
+            
+            total_count = data.get("totalCount", 0)
+            if len(movies) >= total_count:
+                break
+            
+            page += 1
+        
+        logger.info(f"Cached {len(movies)} movies from Lingarr")
+        
+        # Fetch all shows with pagination
+        shows = {}
+        page = 1
+        
+        while True:
+            response = await client.get(
+                f"{lingarr_url}/api/Media/shows",
+                params={"pageSize": page_size, "pageNumber": page}
+            )
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("items", [])
+            
+            if not items:
+                break
+            
+            for item in items:
+                path = item.get("path", "")
+                sonarr_id = item.get("sonarrId")
+                if path and sonarr_id:
+                    shows[path] = sonarr_id
+            
+            total_count = data.get("totalCount", 0)
+            if len(shows) >= total_count:
+                break
+            
+            page += 1
+        
+        logger.info(f"Cached {len(shows)} shows from Lingarr")
+        
+        # Update cache
+        lingarr_media_cache["movies"] = movies
+        lingarr_media_cache["shows"] = shows
+        lingarr_media_cache["last_refresh"] = current_time
+        
+    except Exception as e:
+        logger.error(f"Failed to refresh Lingarr media cache: {e}")
+
 async def find_lingarr_media_id(subtitle_path: str, media_type: str, client: httpx.AsyncClient) -> Optional[int]:
     """
-    Find the Lingarr media ID for a given subtitle path.
+    Find the Lingarr media ID for a given subtitle path using cached data.
     Returns the Lingarr internal media ID or None if not found.
     """
     try:
-        # Get subtitles for this path from Lingarr
-        response = await client.post(
-            f"{lingarr_url}/api/Subtitle/all",
-            json={"path": subtitle_path}
-        )
-        response.raise_for_status()
-        subtitles = response.json()
+        import os
         
-        if not subtitles or len(subtitles) == 0:
-            return None
+        # Refresh cache if needed
+        await refresh_lingarr_media_cache(client)
         
         # Extract the directory path (parent of subtitle file)
-        import os
         media_dir = os.path.dirname(subtitle_path)
         
-        # Search for the media in Lingarr's database by path
-        if media_type == "Episode":
-            # For shows, we need to find by the show path
-            response = await client.get(
-                f"{lingarr_url}/api/Media/shows",
-                params={"searchQuery": media_dir, "pageSize": 100}
-            )
-        else:  # Movie
-            response = await client.get(
-                f"{lingarr_url}/api/Media/movies",
-                params={"searchQuery": media_dir, "pageSize": 100}
-            )
+        # Get the appropriate cache
+        cache = lingarr_media_cache["movies"] if media_type == "Movie" else lingarr_media_cache["shows"]
         
-        response.raise_for_status()
-        data = response.json()
-        items = data.get("items", [])
+        logger.debug(f"Searching for {media_dir} in {len(cache)} cached {media_type}s")
         
-        # Find media that matches the path
-        for item in items:
-            item_path = item.get("path", "")
-            if media_dir.startswith(item_path) or item_path in media_dir:
-                if media_type == "Episode":
-                    # For episodes, we need to find the specific episode
-                    # Return the sonarrId as mediaId for episodes
-                    return item.get("sonarrId")
-                else:
-                    # For movies, return the radarrId
-                    return item.get("radarrId")
+        # Try exact match first (normalized paths)
+        normalized_media_dir = os.path.normpath(media_dir)
+        for cached_path, media_id in cache.items():
+            if os.path.normpath(cached_path) == normalized_media_dir:
+                logger.debug(f"Found exact match: {cached_path} -> ID {media_id}")
+                return media_id
         
+        # Try partial match - find if media_dir is within any cached path
+        for cached_path, media_id in cache.items():
+            if media_dir.startswith(cached_path) or cached_path in media_dir:
+                logger.debug(f"Found partial match: {cached_path} -> ID {media_id}")
+                return media_id
+        
+        logger.debug(f"No match found for {media_dir} in cache")
         return None
         
     except Exception as e:
