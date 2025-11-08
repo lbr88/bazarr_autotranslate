@@ -6,11 +6,13 @@ import signal
 import asyncio
 import logging
 import threading
+import time
 from dotenv import load_dotenv
 from typing import List, Optional
 from unique_queue import UniqueQueue
 from logging.handlers import TimedRotatingFileHandler
 from class_types import Serie, Movie, SubtitleTranslate
+from web_interface import init_web_interface, run_web_interface, WebLogHandler, add_processed_item, add_failed_item, get_failed_items
 
 def get_env_or_default(env, default):
     val = os.getenv(env)
@@ -43,10 +45,14 @@ num_workers = int(get_env_or_default("NUM_WORKERS", 1))
 interval_between_scans = int(get_env_or_default("INTERVAL_BETWEEN_SCANS", 5 * 60))
 batch_size = int(get_env_or_default("BATCH_SIZE", 50))
 dual_queue_mode = os.getenv("DUAL_QUEUE", "false").lower() in ("true", "1", "yes")
+web_ui_enabled = os.getenv("WEB_UI", "true").lower() in ("true", "1", "yes")
+web_ui_port = int(get_env_or_default("WEB_UI_PORT", 6700))
 log_level = get_env_or_default("LOG_LEVEL", "INFO")
 log_directory = get_env_or_default("LOG_DIRECTORY", "")
 series_scan = bool(get_env_or_default("SERIES_SCAN", True))
 movies_scan = bool(get_env_or_default("MOVIES_SCAN", True))
+max_retries = int(get_env_or_default("MAX_RETRIES", 3))
+min_translation_time = float(get_env_or_default("MIN_TRANSLATION_TIME", 10.0))  # Minimum expected translation time in seconds
 
 key_fn = lambda x: f" {"s" if get_attr_or_key(x, "is_serie") else "m"} {get_attr_or_key(x, "video_id")}_{get_attr_or_key(x, "to_language")}"
 
@@ -61,6 +67,9 @@ else:
     movies_queue = None
 
 shutdown_event = asyncio.Event()
+manual_scan_event = asyncio.Event()
+manual_scan_series_event = asyncio.Event()
+manual_scan_movies_event = asyncio.Event()
 logger = logging.getLogger("bazarr_lingarr")
 
 async def get_episodes_metadata(
@@ -261,6 +270,11 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
         # Get video id from correct property depending the video instance
         video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
         for missing_sub in video.missing_subtitles:
+            # Validate language code
+            if not is_valid_language_code(missing_sub.code2):
+                logger.warning(f"Invalid language code '{missing_sub.code2}' found in missing subtitles for video {video_id}. Skipping. This may be a Bazarr data issue.")
+                continue
+                
             # Check if the missing subtitle is in the list for language to be translated in
             if missing_sub.code2 in to_languges:
                 # Check if that subtitle is already in the translation list
@@ -326,6 +340,11 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
                 continue # Skip metadata for subtitle if it's in the same language to for the translation
                 # I don't think this should happen but better safe than sorry
 
+            # Validate the language code before processing
+            if not is_valid_language_code(sub.code2):
+                logger.warning(f"Invalid language code '{sub.code2}' found for subtitle '{sub.name}' on video {video_id}. Skipping. This may be a Bazarr data issue.")
+                continue
+
             # If the subtitle is in the base language list, associate it with the language to translate in
             if sub.code2 in base_languages:
                 # Get video title
@@ -357,14 +376,60 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
 seen_items = set()
 seen_items_lock = threading.Lock()
 
+# Track retry counts persistently (survives across scanner runs)
+retry_counts = {}  # key: item_key, value: retry_count
+retry_counts_lock = threading.Lock()
+
+def is_valid_language_code(code: str) -> bool:
+    """Validate that a language code is a proper 2-character ISO 639-1 code."""
+    if not isinstance(code, str):
+        return False
+    # Must be exactly 2 characters and only letters
+    if len(code) != 2:
+        return False
+    if not code.isalpha():
+        return False
+    return True
+
 def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate], priority: bool = False):
     """Queue subtitles for translation. If priority=True, new items go to front of queue."""
     new_count = 0
     existing_count = 0
+    failed_skipped = 0
+    in_queue_count = 0
+    current_time = time.time()
+    
+    # Get current failed items if web UI is enabled
+    failed_items = get_failed_items() if web_ui_enabled else {}
     
     for sub in subtitles:
+        # Set queued timestamp
+        sub.queued_at = current_time
+        
         # Create a unique key for this subtitle
         item_key = f"{sub.video_id}_{sub.to_language}_{sub.base_subtitle.code2}"
+        
+        # Restore retry count from persistent storage
+        with retry_counts_lock:
+            sub.retry_count = retry_counts.get(item_key, 0)
+        
+        # Skip if item is in failed state (awaiting manual retry)
+        if item_key in failed_items:
+            failed_skipped += 1
+            logger.debug(f"Skipping failed item awaiting manual retry: {sub.base_subtitle.path}")
+            continue
+        
+        # Check if item is already in the appropriate queue
+        check_dict = {"is_serie": sub.is_serie, "video_id": sub.video_id, "to_language": sub.to_language}
+        if dual_queue_mode:
+            check_queue = series_queue if sub.is_serie else movies_queue
+        else:
+            check_queue = task_queue
+        
+        if check_queue.check(check_dict):
+            in_queue_count += 1
+            logger.debug(f"Skipping item already in queue: {sub.base_subtitle.path}")
+            continue
         
         with seen_items_lock:
             is_new = item_key not in seen_items
@@ -395,6 +460,10 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate], priority
         logger.info(f"Added {new_count} new items to translation queue" + (" with priority" if priority else ""))
     if existing_count > 0:
         logger.debug(f"Skipped {existing_count} items already in queue")
+    if failed_skipped > 0:
+        logger.info(f"Skipped {failed_skipped} failed items awaiting manual retry")
+    if in_queue_count > 0:
+        logger.debug(f"Skipped {in_queue_count} items currently being processed")
 
 def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
     """Worker thread that processes translation requests from queue.
@@ -424,7 +493,18 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                 sub = work_queue.get()
                 if sub is None:
                     continue
-                logger.info(f"[{worker_label}] Translating: {sub.base_subtitle.path} to: {sub.to_language}")
+                
+                # Mark start time
+                sub.started_at = time.time()
+                queue_time = sub.started_at - sub.queued_at if sub.queued_at > 0 else 0
+                
+                # Check if subtitle filename contains language code
+                filename = sub.base_subtitle.path
+                has_lang_code = f".{sub.base_subtitle.code2}." in filename.lower() or filename.lower().endswith(f".{sub.base_subtitle.code2}.srt")
+                if not has_lang_code:
+                    logger.warning(f"[{worker_label}] Subtitle file missing language code in filename: {filename} (expected .{sub.base_subtitle.code2}. - this may cause Lingarr to fail)")
+                
+                logger.info(f"[{worker_label}] Translating: {sub.base_subtitle.path} ({sub.base_subtitle.code2} → {sub.to_language}) (queued for {queue_time:.1f}s)")
 
                 params = {
                     "action": "translate",
@@ -439,12 +519,107 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
 
                 response = client.patch(endpoint, headers=headers, params=params)
                 response.raise_for_status()
+                
+                # Mark completion time
+                sub.completed_at = time.time()
+                translation_time = sub.completed_at - sub.started_at
+                total_time = sub.completed_at - sub.queued_at if sub.queued_at > 0 else translation_time
+                
+                # Check if translation completed suspiciously fast (likely a failure)
+                is_failed = False
+                item_key = f"{sub.video_id}_{sub.to_language}_{sub.base_subtitle.code2}"
+                
+                if translation_time < min_translation_time:
+                    if sub.retry_count < max_retries:
+                        sub.retry_count += 1
+                        
+                        # Update persistent retry count
+                        with retry_counts_lock:
+                            retry_counts[item_key] = sub.retry_count
+                        
+                        logger.warning(f"[{worker_label}] Translation completed too quickly ({translation_time:.1f}s < {min_translation_time}s) - likely failed. Retry {sub.retry_count}/{max_retries}")
+                        
+                        # Add to processed items to show retry attempt
+                        if web_ui_enabled:
+                            logger.debug(f"[{worker_label}] Adding retry attempt to processed items - Title: {sub.video_title}, Retry: {sub.retry_count}/{max_retries}")
+                            add_processed_item({
+                                'title': sub.video_title,
+                                'video_id': sub.video_id,
+                                'is_serie': sub.is_serie,
+                                'from_language': sub.base_subtitle.code2,
+                                'to_language': sub.to_language,
+                                'queue_time': queue_time,
+                                'translation_time': translation_time,
+                                'total_time': total_time,
+                                'retry_count': sub.retry_count,
+                                'failed': False,  # Not permanently failed yet
+                                'retrying': True,  # Currently retrying
+                                'item_key': item_key
+                            })
+                        
+                        # Re-queue the item with priority
+                        if dual_queue_mode:
+                            target_queue = series_queue if sub.is_serie else movies_queue
+                        else:
+                            target_queue = task_queue
+                        
+                        # Reset timestamps for retry
+                        sub.queued_at = time.time()
+                        sub.started_at = 0.0
+                        sub.completed_at = 0.0
+                        
+                        target_queue.put(sub, priority=True)
+                        work_queue.done(sub)
+                        continue  # Skip the rest - don't add completed item since we're retrying
+                    else:
+                        is_failed = True
+                        logger.error(f"[{worker_label}] Translation failed after {max_retries} retries - giving up on {sub.base_subtitle.path}")
+                        
+                        # Remove from retry counts (permanently failed)
+                        with retry_counts_lock:
+                            retry_counts.pop(item_key, None)
+                        
+                        # Remove from seen_items so it won't be blocked from future manual retry
+                        with seen_items_lock:
+                            seen_items.discard(item_key)
+                        
+                        # Store failed item for manual retry via web interface
+                        if web_ui_enabled:
+                            add_failed_item(item_key, sub)
+                            logger.debug(f"[{worker_label}] Stored failed item with key: {item_key}")
+                else:
+                    # Success - clear retry count
+                    with retry_counts_lock:
+                        retry_counts.pop(item_key, None)
 
-                logger.info(f"[{worker_label}] Translation finished")
+                # Only add to final processed list if we're done (not retrying)
+                logger.info(f"[{worker_label}] Translation finished (translation: {translation_time:.1f}s, total: {total_time:.1f}s){' - FAILED' if is_failed else ''}")
+                
+                # Track processed item for web UI (only for final success/failure, not retries)
+                if web_ui_enabled:
+                    item_key = f"{sub.video_id}_{sub.to_language}_{sub.base_subtitle.code2}"
+                    logger.debug(f"[{worker_label}] Adding final result to processed items - Title: {sub.video_title}, Failed: {is_failed}")
+                    add_processed_item({
+                        'title': sub.video_title,
+                        'video_id': sub.video_id,
+                        'is_serie': sub.is_serie,
+                        'from_language': sub.base_subtitle.code2,
+                        'to_language': sub.to_language,
+                        'queue_time': queue_time,
+                        'translation_time': translation_time,
+                        'total_time': total_time,
+                        'retry_count': sub.retry_count,
+                        'failed': is_failed,
+                        'item_key': item_key
+                    })
+                    logger.debug(f"[{worker_label}] Successfully added final result to processed items")
+                    
             except queue.Empty:
                 continue
             except Exception as e:
-                logger.error(f"[{worker_label}] Error while translating: {e}")
+                logger.error(f"[{worker_label}] Error while translating {sub.base_subtitle.path if sub else 'unknown'} ({sub.base_subtitle.code2 if sub else '?'} → {sub.to_language if sub else '?'}): {e}")
+                if sub:
+                    logger.error(f"[{worker_label}] Failed subtitle details - Video ID: {sub.video_id}, Path: {sub.base_subtitle.path}")
             
             work_queue.done(sub)
 
@@ -478,17 +653,38 @@ async def scanner_task(base_url, api_key):
     
     while not shutdown_event.is_set():
         try:
+            # Determine what to scan based on triggered events
+            scan_series_now = series_scan
+            scan_movies_now = movies_scan
+            
             all_subtitles = []
             
-            if series_scan:
-                series_subs = await scan_series(base_url, api_key)
+            # In dual queue mode, scan both simultaneously
+            if dual_queue_mode and scan_series_now and scan_movies_now:
+                results = await asyncio.gather(
+                    scan_series(base_url, api_key),
+                    scan_movies(base_url, api_key),
+                    return_exceptions=True
+                )
+                
+                series_subs = results[0] if not isinstance(results[0], Exception) else None
+                movies_subs = results[1] if not isinstance(results[1], Exception) else None
+                
                 if series_subs:
                     all_subtitles.extend(series_subs)
-            
-            if movies_scan:
-                movies_subs = await scan_movies(base_url, api_key)
                 if movies_subs:
                     all_subtitles.extend(movies_subs)
+            else:
+                # Sequential scanning for single queue mode or when only one type is enabled
+                if scan_series_now:
+                    series_subs = await scan_series(base_url, api_key)
+                    if series_subs:
+                        all_subtitles.extend(series_subs)
+                
+                if scan_movies_now:
+                    movies_subs = await scan_movies(base_url, api_key)
+                    if movies_subs:
+                        all_subtitles.extend(movies_subs)
             
             if all_subtitles:
                 # First scan: add all to queue normally
@@ -529,10 +725,72 @@ async def scanner_task(base_url, api_key):
         except Exception as e:
             logger.error(f"Error in scanner task: {e}", exc_info=True)
         
-        # Wait before next scan
-        await asyncio.sleep(interval_between_scans)
+        # Wait for either the interval or manual scan trigger
+        try:
+            # Check for specific queue scans or general scan
+            done, pending = await asyncio.wait(
+                [
+                    asyncio.create_task(manual_scan_event.wait()),
+                    asyncio.create_task(manual_scan_series_event.wait()),
+                    asyncio.create_task(manual_scan_movies_event.wait())
+                ],
+                timeout=interval_between_scans,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+            
+            # Check which event was triggered
+            if manual_scan_event.is_set():
+                manual_scan_event.clear()
+                logger.info("Manual scan triggered from web UI (all types)")
+            if manual_scan_series_event.is_set():
+                manual_scan_series_event.clear()
+                logger.info("Manual scan triggered from web UI (series only)")
+            if manual_scan_movies_event.is_set():
+                manual_scan_movies_event.clear()
+                logger.info("Manual scan triggered from web UI (movies only)")
+                
+        except asyncio.TimeoutError:
+            pass  # Normal timeout, continue with next scan
+
+def trigger_manual_scan():
+    """Trigger a manual scan from web UI."""
+    manual_scan_event.set()
+
+def trigger_manual_scan_series():
+    """Trigger a manual scan for series only from web UI."""
+    manual_scan_series_event.set()
+
+def trigger_manual_scan_movies():
+    """Trigger a manual scan for movies only from web UI."""
+    manual_scan_movies_event.set()
 
 async def main(base_url, api_key):
+    # Start web interface if enabled
+    if web_ui_enabled:
+        logger.info(f"Starting web interface on port {web_ui_port}")
+        init_web_interface(
+            dual_queue_mode, 
+            task_queue, 
+            series_queue, 
+            movies_queue, 
+            trigger_manual_scan,
+            trigger_manual_scan_series,
+            trigger_manual_scan_movies,
+            seen_items,
+            seen_items_lock
+        )
+        web_thread = threading.Thread(
+            target=run_web_interface, 
+            args=('0.0.0.0', web_ui_port), 
+            daemon=True
+        )
+        web_thread.start()
+        logger.info(f"Web interface available at http://localhost:{web_ui_port}")
+    
     # Start translation worker threads
     if dual_queue_mode:
         # Split workers between series and movies (at least 1 for each if num_workers >= 2)
@@ -612,6 +870,12 @@ if __name__ == "__main__":
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    
+    # Add web log handler if web UI is enabled
+    if web_ui_enabled:
+        web_handler = logging.StreamHandler(WebLogHandler())
+        web_handler.setFormatter(formatter)
+        logger.addHandler(web_handler)
 
     match log_level.lower():
         case "info":
@@ -627,6 +891,8 @@ if __name__ == "__main__":
             logger.debug(f"interval_between_scans: {interval_between_scans}")
             logger.debug(f"batch_size: {batch_size}")
             logger.debug(f"dual_queue_mode: {dual_queue_mode}")
+            logger.debug(f"web_ui_enabled: {web_ui_enabled}")
+            logger.debug(f"web_ui_port: {web_ui_port}")
             logger.debug(f"log_level: {log_level}")
             logger.debug(f"log_directory: {log_directory}")
             logger.debug(f"series_scan: {series_scan}")

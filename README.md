@@ -23,6 +23,7 @@ A Python script that automates subtitle translation in Bazarr by leveraging its 
 - Queues translation requests using Bazarr API.
 - **Concurrent scanning and processing**: Scanner runs independently from translation workers, allowing new items to be detected while processing continues.
 - **Priority queue for new items**: Newly added content is prioritized and translated first, so users don't wait through the entire backlog.
+- **Web interface**: Real-time monitoring and control of translation queues with ability to force scans and prioritize items.
 - Configurable scanning intervals and worker concurrency.
 - Logs actions and errors for easier monitoring.
 
@@ -61,6 +62,8 @@ The script is configured via environment variables using a `.env` file in the sa
 | `INTERVAL_BETWEEN_SCANS`     | Interval (in seconds) between each automatic scan of your Bazarr library.                        | 300 (5 minutes) |
 | `BATCH_SIZE`                  | Number of items to fetch per API request when retrieving metadata. Lower values reduce URL length but increase API calls. | 50 |
 | `DUAL_QUEUE`                  | Enable separate queues for series and movies, allowing both to be processed concurrently. Set to `true` to enable. | false |
+| `WEB_UI`                      | Enable the web interface for monitoring and controlling queues. Set to `false` to disable. | true |
+| `WEB_UI_PORT`                 | Port number for the web interface. | 6700 |
 | `LOG_LEVEL`                   | Logging level. Options: `DEBUG`, `INFO`, `ERROR`.                                     | INFO            |
 | `LOG_DIRECTORY`              | Directory where logs will be saved. Will be created if it doesn't exist.                         | `logs/`         |
 | `SERIES_SCAN`                 | Whether to scan TV series for missing subtitles (`true` or `false`).                             | true            |
@@ -143,10 +146,33 @@ services:
             - TO_LANGUAGES=<languages>
             - LOG_LEVEL=info
             # any other configuration needed
+        ports:
+            - "6700:6700"  # Web UI port
         volumes:
             # if logs are wanted 
             - ./logs:/usr/src/app/logs
 ```
+
+## Web Interface
+
+The application includes a web interface for real-time monitoring and control of translation queues.
+
+**Features:**
+- View all items in the queue(s) in real-time
+- See series and movies queues side-by-side (when dual queue mode is enabled)
+- Force a manual scan at any time
+- Move items to the top of the queue for priority processing
+- Auto-refresh every 5 seconds (can be toggled off)
+
+**Access:** Open your browser to `http://localhost:6700` (or the port configured via `WEB_UI_PORT`)
+
+**Port Configuration:**
+- Default port: `6700`
+- Configure via `WEB_UI_PORT` environment variable
+- Disable web UI by setting `WEB_UI=false`
+
+**Docker Port Mapping:**
+Make sure to expose the port in your docker-compose.yml as shown in the example above.
 
 ## Contributing
 

@@ -51,3 +51,14 @@ class UniqueQueue:
         """Return the first n items in the queue without removing them."""
         with self.lock:
             return list(self.q)[:n]
+    
+    def move_to_top(self, index):
+        """Move item at index to the front of the queue."""
+        with self.lock:
+            if 0 <= index < len(self.q):
+                item = self.q[index]
+                del self.q[index]
+                self.q.appendleft(item)
+                self.not_empty.notify()
+                return True
+            return False

@@ -252,13 +252,21 @@ class SubtitleTranslate:
     video_id: int
     is_serie: bool
     video_title: str
+    queued_at: float  # Timestamp when added to queue
+    started_at: float  # Timestamp when worker starts processing
+    completed_at: float  # Timestamp when translation completes
+    retry_count: int  # Number of retry attempts
 
-    def __init__(self, base_subtitle: Subtitle, to_language: str, video_id: int, is_serie: bool, video_title: str = "Unknown") -> None:
+    def __init__(self, base_subtitle: Subtitle, to_language: str, video_id: int, is_serie: bool, video_title: str = "Unknown", queued_at: float = 0.0, started_at: float = 0.0, completed_at: float = 0.0, retry_count: int = 0) -> None:
         self.base_subtitle = base_subtitle
         self.to_language = to_language
         self.video_id = video_id
         self.is_serie = is_serie
         self.video_title = video_title
+        self.queued_at = queued_at
+        self.started_at = started_at
+        self.completed_at = completed_at
+        self.retry_count = retry_count
 
     def to_dict(self):
         return {
@@ -266,5 +274,9 @@ class SubtitleTranslate:
             "to_language": self.to_language,
             "video_id": self.video_id,
             "is_serie": self.is_serie,
-            "video_title": self.video_title
+            "video_title": self.video_title,
+            "queued_at": self.queued_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "retry_count": self.retry_count
         }
