@@ -12,7 +12,7 @@ from typing import List, Optional
 from unique_queue import UniqueQueue
 from logging.handlers import TimedRotatingFileHandler
 from class_types import Serie, Movie, SubtitleTranslate
-from web_interface import init_web_interface, run_web_interface, WebLogHandler, add_processed_item, add_failed_item, get_failed_items
+from web_interface import init_web_interface, run_web_interface, WebLogHandler, add_processed_item, add_failed_item, get_failed_items, update_item_state
 
 def get_env_or_default(env, default):
     val = os.getenv(env)
@@ -447,6 +447,17 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate], priority
             # Use single queue
             task_queue.put(sub, priority=use_priority)
         
+        # Track item as queued in web UI
+        if web_ui_enabled:
+            update_item_state(item_key, 'queued', {
+                'title': sub.video_title,
+                'video_id': sub.video_id,
+                'is_serie': sub.is_serie,
+                'from_language': sub.base_subtitle.code2,
+                'to_language': sub.to_language,
+                'retry_count': sub.retry_count
+            })
+        
         if is_new:
             new_count += 1
             if use_priority:
@@ -498,6 +509,20 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                 sub.started_at = time.time()
                 queue_time = sub.started_at - sub.queued_at if sub.queued_at > 0 else 0
                 
+                # Track item as processing
+                item_key = f"{sub.video_id}_{sub.to_language}_{sub.base_subtitle.code2}"
+                if web_ui_enabled:
+                    logger.debug(f"[{worker_label}] Updating item to 'processing' state: {item_key}")
+                    update_item_state(item_key, 'processing', {
+                        'title': sub.video_title,
+                        'video_id': sub.video_id,
+                        'is_serie': sub.is_serie,
+                        'from_language': sub.base_subtitle.code2,
+                        'to_language': sub.to_language,
+                        'retry_count': sub.retry_count,
+                        'queue_time': queue_time
+                    })
+                
                 # Check if subtitle filename contains language code
                 filename = sub.base_subtitle.path
                 has_lang_code = f".{sub.base_subtitle.code2}." in filename.lower() or filename.lower().endswith(f".{sub.base_subtitle.code2}.srt")
@@ -539,10 +564,10 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                         
                         logger.warning(f"[{worker_label}] Translation completed too quickly ({translation_time:.1f}s < {min_translation_time}s) - likely failed. Retry {sub.retry_count}/{max_retries}")
                         
-                        # Add to processed items to show retry attempt
+                        # Update item state to retrying
                         if web_ui_enabled:
-                            logger.debug(f"[{worker_label}] Adding retry attempt to processed items - Title: {sub.video_title}, Retry: {sub.retry_count}/{max_retries}")
-                            add_processed_item({
+                            logger.debug(f"[{worker_label}] Updating item to retrying state - Title: {sub.video_title}, Retry: {sub.retry_count}/{max_retries}")
+                            update_item_state(item_key, 'retrying', {
                                 'title': sub.video_title,
                                 'video_id': sub.video_id,
                                 'is_serie': sub.is_serie,
@@ -551,10 +576,7 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                                 'queue_time': queue_time,
                                 'translation_time': translation_time,
                                 'total_time': total_time,
-                                'retry_count': sub.retry_count,
-                                'failed': False,  # Not permanently failed yet
-                                'retrying': True,  # Currently retrying
-                                'item_key': item_key
+                                'retry_count': sub.retry_count
                             })
                         
                         # Re-queue the item with priority
@@ -595,11 +617,11 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                 # Only add to final processed list if we're done (not retrying)
                 logger.info(f"[{worker_label}] Translation finished (translation: {translation_time:.1f}s, total: {total_time:.1f}s){' - FAILED' if is_failed else ''}")
                 
-                # Track processed item for web UI (only for final success/failure, not retries)
+                # Update item state to final result
                 if web_ui_enabled:
                     item_key = f"{sub.video_id}_{sub.to_language}_{sub.base_subtitle.code2}"
-                    logger.debug(f"[{worker_label}] Adding final result to processed items - Title: {sub.video_title}, Failed: {is_failed}")
-                    add_processed_item({
+                    logger.debug(f"[{worker_label}] Updating item to final state - Title: {sub.video_title}, Failed: {is_failed}")
+                    update_item_state(item_key, 'failed' if is_failed else 'completed', {
                         'title': sub.video_title,
                         'video_id': sub.video_id,
                         'is_serie': sub.is_serie,
@@ -608,11 +630,8 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                         'queue_time': queue_time,
                         'translation_time': translation_time,
                         'total_time': total_time,
-                        'retry_count': sub.retry_count,
-                        'failed': is_failed,
-                        'item_key': item_key
+                        'retry_count': sub.retry_count
                     })
-                    logger.debug(f"[{worker_label}] Successfully added final result to processed items")
                     
             except queue.Empty:
                 continue
