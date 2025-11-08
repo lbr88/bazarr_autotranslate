@@ -301,19 +301,40 @@
     <div class="container">
         <header>
             <h1>🎬 Bazarr AutoTranslate - Queue Monitor</h1>
-            <p>Real-time monitoring and control of translation queues</p>
+            <p>Real-time monitoring and control of translation queues (WebSocket)</p>
             <div class="controls">
                 <button onclick="triggerScan()">🔄 Force Scan</button>
-                <button onclick="refreshItems()">↻ Refresh Now</button>
-                <label class="refresh-toggle">
-                    <input type="checkbox" id="autoRefresh" checked onchange="toggleAutoRefresh()">
-                    <span id="autoRefreshLabel">Auto-refresh (5s)</span>
-                </label>
             </div>
         </header>
         
-        <div id="itemsContainer" class="queue-container">
-            <div class="loading">Loading items...</div>
+        <div id="itemsContainer" class="queue-container {% if not dual_queue_mode %}single{% endif %}">
+            {% if dual_queue_mode %}
+            <div class="queue-section">
+                <div class="queue-header">
+                    <span id="seriesHeader" class="queue-title">📺 Series Queue</span>
+                </div>
+                <div id="seriesItems" class="queue-items">
+                    <div class="loading">Connecting...</div>
+                </div>
+            </div>
+            <div class="queue-section">
+                <div class="queue-header">
+                    <span id="moviesHeader" class="queue-title">🎬 Movies Queue</span>
+                </div>
+                <div id="moviesItems" class="queue-items">
+                    <div class="loading">Connecting...</div>
+                </div>
+            </div>
+            {% else %}
+            <div class="queue-section">
+                <div class="queue-header">
+                    <span id="combinedHeader" class="queue-title">📋 Translation Queue</span>
+                </div>
+                <div id="combinedItems" class="queue-items">
+                    <div class="loading">Connecting...</div>
+                </div>
+            </div>
+            {% endif %}
         </div>
         
         <div class="log-section">
@@ -329,12 +350,10 @@
     
     <div id="statusMessage" class="status-message"></div>
     
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script>
-        let autoRefreshEnabled = true;
-        let autoRefreshInterval = null;
-        let countdownInterval = null;
-        let secondsUntilRefresh = 5;
-        let isRefreshing = false;
+        let socket = null;
+        let isConnected = false;
         const dualQueueMode = {{ dual_queue_mode|tojson }};
         
         function showStatus(message, duration = 3000) {
@@ -347,74 +366,178 @@
             }, duration);
         }
         
-        function updateRefreshLabel() {
-            const label = document.getElementById('autoRefreshLabel');
-            if (!autoRefreshEnabled) {
-                label.textContent = 'Auto-refresh (paused)';
-            } else if (isRefreshing) {
-                label.textContent = '⟳ Refreshing...';
-            } else {
-                label.textContent = `Auto-refresh (${secondsUntilRefresh}s)`;
-            }
-        }
-        
-        function startCountdown() {
-            if (countdownInterval) return;
-            secondsUntilRefresh = 5;
-            updateRefreshLabel();
+        function initWebSocket() {
+            console.log('[WebSocket] Initializing connection...');
+            socket = io({
+                transports: ['websocket', 'polling'],
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionAttempts: 10
+            });
             
-            countdownInterval = setInterval(() => {
-                secondsUntilRefresh--;
-                if (secondsUntilRefresh <= 0) {
-                    secondsUntilRefresh = 5;
+            socket.on('connect', () => {
+                console.log('[WebSocket] Connected successfully');
+                isConnected = true;
+                showStatus('✓ Connected', 2000);
+            });
+            
+            socket.on('connect_error', (error) => {
+                console.error('[WebSocket] Connection error:', error);
+                showStatus('⚠ Connection error', 3000);
+            });
+            
+            socket.on('disconnect', () => {
+                console.log('[WebSocket] Disconnected');
+                isConnected = false;
+                showStatus('⚠ Disconnected - trying to reconnect...', 5000);
+            });
+            
+            socket.on('queue_update', (data) => {
+                console.log('[WebSocket] Received queue update:', data);
+                updateUI(data);
+            });
+            
+            socket.on('log_update', (data) => {
+                console.log('[WebSocket] Received log update');
+                updateLogs(data.logs);
+            });
+            
+            socket.on('error', (error) => {
+                console.error('[WebSocket] Error:', error);
+            });
+        }
+        
+        function updateUI(data) {
+            console.log('[UI] Updating with data:', data);
+            try {
+                if (data.dual_queue_mode) {
+                    updateDualQueue(data.series, data.movies);
+                } else {
+                    updateSingleQueue(data.items);
                 }
-                updateRefreshLabel();
-            }, 1000);
-        }
-        
-        function stopCountdown() {
-            if (countdownInterval) {
-                clearInterval(countdownInterval);
-                countdownInterval = null;
+            } catch (error) {
+                console.error('[UI] Error updating UI:', error);
             }
-            updateRefreshLabel();
         }
         
-        function toggleAutoRefresh() {
-            autoRefreshEnabled = document.getElementById('autoRefresh').checked;
-            if (autoRefreshEnabled) {
-                startAutoRefresh();
-                startCountdown();
+        function countItemsByState(items) {
+            const counts = {
+                queued: 0,
+                processing: 0,
+                retrying: 0,
+                completed: 0,
+                failed: 0
+            };
+            
+            items.forEach(item => {
+                if (item.state && counts.hasOwnProperty(item.state)) {
+                    counts[item.state]++;
+                }
+            });
+            
+            return counts;
+        }
+        
+        function renderItem(item) {
+            const stateEmojis = {
+                queued: '🟦',
+                processing: '⚙️',
+                retrying: '🔄',
+                completed: '✅',
+                failed: '❌'
+            };
+            
+            const stateColors = {
+                queued: '#1a5490',
+                processing: '#ff8c00',
+                retrying: '#ffcc00',
+                completed: '#00884d',
+                failed: '#ff0000'
+            };
+            
+            const emoji = stateEmojis[item.state] || '❓';
+            const color = stateColors[item.state] || '#666';
+            const title = item.video_title || 'Unknown';
+            const lang = item.to_language || '??';
+            const retryInfo = item.retry_count > 0 ? ` (retry ${item.retry_count})` : '';
+            
+            return `
+                <div class="queue-item" style="border-left: 4px solid ${color};">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <span style="font-size: 1.2em; margin-right: 8px;">${emoji}</span>
+                            <strong>${title}</strong>
+                            <span style="color: #888; margin-left: 8px;">→ ${lang}</span>
+                            ${retryInfo}
+                        </div>
+                        <span style="color: ${color}; font-weight: bold;">${item.state.toUpperCase()}</span>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function updateDualQueue(seriesItems, moviesItems) {
+            console.log(`[UI] Updating dual queue: ${seriesItems?.length || 0} series, ${moviesItems?.length || 0} movies`);
+            console.log('[UI] Series data:', seriesItems);
+            console.log('[UI] Movies data:', moviesItems);
+            
+            // Update series queue
+            const seriesEl = document.getElementById('seriesItems');
+            console.log('[UI] Series element:', seriesEl);
+            if (seriesEl) {
+                const seriesCounts = countItemsByState(seriesItems || []);
+                updateQueueHeader('series', seriesCounts);
+                seriesEl.innerHTML = (seriesItems && seriesItems.length > 0) 
+                    ? seriesItems.map(renderItem).join('') 
+                    : '<div class="empty-queue">No series items</div>';
+                console.log('[UI] Series updated, innerHTML length:', seriesEl.innerHTML.length);
             } else {
-                stopAutoRefresh();
-                stopCountdown();
+                console.error('[UI] Series element not found!');
+            }
+            
+            // Update movies queue
+            const moviesEl = document.getElementById('moviesItems');
+            console.log('[UI] Movies element:', moviesEl);
+            if (moviesEl) {
+                const moviesCounts = countItemsByState(moviesItems || []);
+                updateQueueHeader('movies', moviesCounts);
+                moviesEl.innerHTML = (moviesItems && moviesItems.length > 0)
+                    ? moviesItems.map(renderItem).join('')
+                    : '<div class="empty-queue">No movie items</div>';
+                console.log('[UI] Movies updated, innerHTML length:', moviesEl.innerHTML.length);
+            } else {
+                console.error('[UI] Movies element not found!');
             }
         }
         
-        function startAutoRefresh() {
-            if (autoRefreshInterval) return;
-            autoRefreshInterval = setInterval(async () => {
-                isRefreshing = true;
-                updateRefreshLabel();
-                
-                await Promise.all([
-                    refreshItems(),
-                    refreshLogs()
-                ]);
-                
-                isRefreshing = false;
-                secondsUntilRefresh = 5;
-                updateRefreshLabel();
-            }, 5000);
+        function updateSingleQueue(items) {
+            console.log(`[UI] Updating single queue: ${items?.length || 0} items`);
+            const itemsEl = document.getElementById('combinedItems');
+            if (itemsEl) {
+                const counts = countItemsByState(items || []);
+                updateQueueHeader('combined', counts);
+                itemsEl.innerHTML = (items && items.length > 0)
+                    ? items.map(renderItem).join('')
+                    : '<div class="empty-queue">No items yet</div>';
+            }
         }
         
-        function stopAutoRefresh() {
-            if (autoRefreshInterval) {
-                clearInterval(autoRefreshInterval);
-                autoRefreshInterval = null;
-            }
-            isRefreshing = false;
-            updateRefreshLabel();
+        function updateQueueHeader(queueType, counts) {
+            const headerEl = document.getElementById(`${queueType}Header`);
+            if (!headerEl) return;
+            
+            const total = counts.processing + counts.queued + counts.retrying + counts.completed + counts.failed;
+            const title = queueType === 'series' ? '📺 Series Queue' : 
+                         queueType === 'movies' ? '🎬 Movies Queue' : 
+                         '📋 Translation Queue';
+            
+            headerEl.innerHTML = `
+                ${title}
+                <span class="count-badge" style="background: #ff8c00; color: #000;">⚙️ ${counts.processing}</span>
+                <span class="count-badge" style="background: #1a5490;">🟦 ${counts.queued}</span>
+                <span class="count-badge" style="background: #00884d;">✅ ${counts.completed}</span>
+                <span class="count-badge" style="background: #ff0000;">❌ ${counts.failed}</span>
+            `;
         }
         
         async function triggerScan(type = 'all') {
@@ -428,7 +551,6 @@
                 
                 if (data.status === 'success') {
                     showStatus('✓ ' + data.message);
-                    setTimeout(refreshItems, 2000);
                 } else {
                     showStatus('✗ Failed to trigger scan: ' + data.message);
                 }
@@ -448,7 +570,6 @@
                 
                 if (data.status === 'success') {
                     showStatus('✓ Item moved to top!');
-                    refreshItems();
                 } else {
                     showStatus('✗ Failed: ' + data.message);
                 }
@@ -468,9 +589,6 @@
                 
                 if (data.status === 'success') {
                     showStatus('✓ Item queued for retry!');
-                    setTimeout(() => {
-                        refreshItems();
-                    }, 1000);
                 } else {
                     showStatus('✗ Failed to retry: ' + data.message);
                 }
@@ -497,247 +615,23 @@
             document.getElementById('logContainer').innerHTML = '<div class="log-line">Logs cleared...</div>';
         }
         
-        async function refreshLogs() {
-            try {
-                const response = await fetch('/api/logs');
-                const data = await response.json();
-                
-                const logContainer = document.getElementById('logContainer');
-                
-                if (data.logs.length === 0) {
-                    logContainer.innerHTML = '<div class="log-line">No logs yet...</div>';
-                } else {
-                    logContainer.innerHTML = data.logs.map(log => 
-                        `<div class="log-line ${getLogClass(log)}">${escapeHtml(log)}</div>`
-                    ).join('');
-                    
-                    // Auto-scroll to bottom
-                    logContainer.scrollTop = logContainer.scrollHeight;
-                }
-            } catch (error) {
-                console.error('Error refreshing logs:', error);
-            }
-        }
-        
-        async function refreshItems() {
-            try {
-                const response = await fetch('/api/items');
-                const data = await response.json();
-                
-                const itemsContainer = document.getElementById('itemsContainer');
-                
-                if (data.dual_queue_mode) {
-                    // Count items by state for each type
-                    const seriesCounts = countItemsByState(data.series);
-                    const moviesCounts = countItemsByState(data.movies);
-                    
-                    // Dual queue mode - show two separate sections
-                    itemsContainer.className = 'queue-container';
-                    itemsContainer.innerHTML = `
-                        <div class="queue-section">
-                            <div class="queue-header">
-                                <span class="queue-title">📺 Series Translations</span>
-                                <div style="display: flex; gap: 8px;">
-                                    ${seriesCounts.processing > 0 ? `<span class="queue-count" style="background: #ff8c00;">⚙️ ${seriesCounts.processing}</span>` : ''}
-                                    ${seriesCounts.queued > 0 ? `<span class="queue-count" style="background: #1a5490;">🟦 ${seriesCounts.queued}</span>` : ''}
-                                    ${seriesCounts.retrying > 0 ? `<span class="queue-count" style="background: #ff8c00;">🔄 ${seriesCounts.retrying}</span>` : ''}
-                                    ${seriesCounts.completed > 0 ? `<span class="queue-count" style="background: #00884d;">✅ ${seriesCounts.completed}</span>` : ''}
-                                    ${seriesCounts.failed > 0 ? `<span class="queue-count" style="background: #ff0000;">❌ ${seriesCounts.failed}</span>` : ''}
-                                </div>
-                            </div>
-                            <div class="queue-items">
-                                ${data.series.length === 0 ? '<div class="empty-queue">No series items</div>' : 
-                                  data.series.map((item, idx) => renderItem(item)).join('')}
-                            </div>
-                        </div>
-                        <div class="queue-section">
-                            <div class="queue-header">
-                                <span class="queue-title">🎬 Movie Translations</span>
-                                <div style="display: flex; gap: 8px;">
-                                    ${moviesCounts.processing > 0 ? `<span class="queue-count" style="background: #ff8c00;">⚙️ ${moviesCounts.processing}</span>` : ''}
-                                    ${moviesCounts.queued > 0 ? `<span class="queue-count" style="background: #1a5490;">🟦 ${moviesCounts.queued}</span>` : ''}
-                                    ${moviesCounts.retrying > 0 ? `<span class="queue-count" style="background: #ff8c00;">🔄 ${moviesCounts.retrying}</span>` : ''}
-                                    ${moviesCounts.completed > 0 ? `<span class="queue-count" style="background: #00884d;">✅ ${moviesCounts.completed}</span>` : ''}
-                                    ${moviesCounts.failed > 0 ? `<span class="queue-count" style="background: #ff0000;">❌ ${moviesCounts.failed}</span>` : ''}
-                                </div>
-                            </div>
-                            <div class="queue-items">
-                                ${data.movies.length === 0 ? '<div class="empty-queue">No movie items</div>' : 
-                                  data.movies.map((item, idx) => renderItem(item)).join('')}
-                            </div>
-                        </div>
-                    `;
-                } else {
-                    // Count items by state
-                    const counts = countItemsByState(data.items);
-                    
-                    // Single queue mode - show one section
-                    itemsContainer.className = 'queue-container single';
-                    itemsContainer.innerHTML = `
-                        <div class="queue-section">
-                            <div class="queue-header">
-                                <span class="queue-title">🎬 All Translations</span>
-                                <div style="display: flex; gap: 8px;">
-                                    ${counts.processing > 0 ? `<span class="queue-count" style="background: #ff8c00;">⚙️ ${counts.processing}</span>` : ''}
-                                    ${counts.queued > 0 ? `<span class="queue-count" style="background: #1a5490;">🟦 ${counts.queued}</span>` : ''}
-                                    ${counts.retrying > 0 ? `<span class="queue-count" style="background: #ff8c00;">🔄 ${counts.retrying}</span>` : ''}
-                                    ${counts.completed > 0 ? `<span class="queue-count" style="background: #00884d;">✅ ${counts.completed}</span>` : ''}
-                                    ${counts.failed > 0 ? `<span class="queue-count" style="background: #ff0000;">❌ ${counts.failed}</span>` : ''}
-                                </div>
-                            </div>
-                            <div class="queue-items">
-                                ${data.items.length === 0 ? '<div class="empty-queue">No items yet</div>' : 
-                                  data.items.map((item, idx) => renderItem(item)).join('')}
-                            </div>
-                        </div>
-                    `;
-                }
-            } catch (error) {
-                console.error('Error refreshing items:', error);
-            }
-        }
-        
-        function countItemsByState(items) {
-            const counts = {
-                processing: 0,
-                queued: 0,
-                retrying: 0,
-                completed: 0,
-                failed: 0
-            };
-            items.forEach(item => {
-                const state = item.state || 'unknown';
-                if (state in counts) {
-                    counts[state]++;
-                }
-            });
-            return counts;
-        }
-        
-        function renderItem(item) {
-            const state = item.state || 'unknown';
-            const retryCount = item.retry_count || 0;
-            const queueTime = item.queue_time ? `${item.queue_time.toFixed(1)}s` : '–';
-            const translationTime = item.translation_time ? `${item.translation_time.toFixed(1)}s` : '–';
-            const totalTime = item.total_time ? `${item.total_time.toFixed(1)}s` : '–';
+        function updateLogs(logs) {
+            const logContainer = document.getElementById('logContainer');
             
-            // Determine state badge and border color
-            let stateBadge, borderColor;
-            switch (state) {
-                case 'queued':
-                    stateBadge = '<span class="item-badge" style="background: #1a5490;">🟦 Queued</span>';
-                    borderColor = '#1a5490';
-                    break;
-                case 'processing':
-                    stateBadge = '<span class="item-badge" style="background: #ff8c00; color: #000;">⚙️ Processing</span>';
-                    borderColor = '#ff8c00';
-                    break;
-                case 'retrying':
-                    stateBadge = '<span class="item-badge" style="background: #ff8c00; color: #000;">🔄 Retrying</span>';
-                    borderColor = '#ff8c00';
-                    break;
-                case 'completed':
-                    stateBadge = '<span class="item-badge" style="background: #00884d;">✅ Completed</span>';
-                    borderColor = '#00ff88';
-                    break;
-                case 'failed':
-                    stateBadge = '<span class="item-badge" style="background: #ff0000;">❌ Failed</span>';
-                    borderColor = '#ff0000';
-                    break;
-                default:
-                    stateBadge = '<span class="item-badge">❓ Unknown</span>';
-                    borderColor = '#888';
-            }
-            
-            const retryBadge = retryCount > 0 ? `<span class="item-badge" style="background: #8b0000;">🔁 ${retryCount}/${retryCount >= 3 ? 3 : 3}</span>` : '';
-            const retryButton = state === 'failed' ? `<button onclick="retryItem('${item.item_key}')" style="padding: 3px 8px; font-size: 0.85em; margin-left: 10px;">🔄 Retry</button>` : '';
-            
-            // Add move-to-top button for queued items (not first in queue)
-            const queuePosition = item.queue_position;
-            const queueType = item.is_serie ? 'series' : 'movies';
-            const moveButton = (state === 'queued' && queuePosition > 0) ? 
-                `<button onclick="moveToTop('${queueType}', ${queuePosition})" style="padding: 3px 8px; font-size: 0.85em; margin-left: 10px;">⬆️ Move to Top</button>` : '';
-            
-            // Show timing only for processing/completed/retrying/failed states
-            const showTiming = ['processing', 'completed', 'retrying', 'failed'].includes(state);
-            const timingBadges = showTiming ? `
-                <div class="item-details" style="margin-top: 5px;">
-                    <span class="item-badge" style="background: #1a4d2e;">⏱️ Queue: ${queueTime}</span>
-                    <span class="item-badge" style="background: #1a3d5c;">🔄 Translation: ${translationTime}</span>
-                    <span class="item-badge" style="background: #4a1a4d;">⏰ Total: ${totalTime}</span>
-                </div>
-            ` : '';
-            
-            return `
-                <div class="queue-item" style="border-left-color: ${borderColor};">
-                    <div class="item-info">
-                        <div class="item-title">${escapeHtml(item.title)} ${retryButton} ${moveButton}</div>
-                        <div class="item-details">
-                            <span class="item-badge">ID: ${item.video_id}</span>
-                            <span class="item-badge">${item.from_language} <span class="language-arrow">→</span> ${item.to_language}</span>
-                            <span class="item-badge">${item.is_serie ? '📺 Series' : '🎬 Movie'}</span>
-                            ${stateBadge}
-                            ${retryBadge}
-                        </div>
-                        ${timingBadges}
-                    </div>
-                </div>
-            `;
-        }
-        
-        async function refreshProcessed() {
-            // Redirect old function to new unified function
-            return refreshItems();
-        }
-        
-        function renderProcessedItem(item) {
-            // Format timing information
-            const queueTime = item.queue_time ? `${item.queue_time.toFixed(1)}s` : 'N/A';
-            const translationTime = item.translation_time ? `${item.translation_time.toFixed(1)}s` : 'N/A';
-            const totalTime = item.total_time ? `${item.total_time.toFixed(1)}s` : 'N/A';
-            const retryCount = item.retry_count || 0;
-            const isFailed = item.failed || false;
-            const isRetrying = item.retrying || false;
-            const retryBadge = retryCount > 0 ? `<span class="item-badge" style="background: #8b0000;">🔁 Retries: ${retryCount}</span>` : '';
-            
-            // Determine status badge
-            let statusBadge;
-            if (isFailed) {
-                statusBadge = `<span class="item-badge" style="background: #ff0000;">❌ FAILED</span>`;
-            } else if (isRetrying) {
-                statusBadge = `<span class="item-badge" style="background: #ff8c00;">🔄 Retrying</span>`;
+            if (!logs || logs.length === 0) {
+                logContainer.innerHTML = '<div class="log-line">No logs yet...</div>';
             } else {
-                statusBadge = '<span class="item-badge">✅ Completed</span>';
+                logContainer.innerHTML = logs.map(log => 
+                    `<div class="log-line ${getLogClass(log)}">${escapeHtml(log)}</div>`
+                ).join('');
+                
+                // Auto-scroll to bottom
+                logContainer.scrollTop = logContainer.scrollHeight;
             }
-            
-            const retryButton = isFailed ? `<button onclick="retryItem('${item.item_key}')" style="padding: 3px 8px; font-size: 0.85em; margin-left: 10px;">🔄 Retry</button>` : '';
-            
-            return `
-                <div class="queue-item" style="border-left-color: ${isFailed ? '#ff0000' : (isRetrying ? '#ff8c00' : '#00ff88')};">
-                    <div class="item-info">
-                        <div class="item-title">${escapeHtml(item.title)} ${retryButton}</div>
-                        <div class="item-details">
-                            <span class="item-badge">ID: ${item.video_id}</span>
-                            <span class="item-badge">${item.from_language} <span class="language-arrow">→</span> ${item.to_language}</span>
-                            <span class="item-badge">${item.is_serie ? '📺 Series' : '🎬 Movie'}</span>
-                            ${statusBadge}
-                        </div>
-                        <div class="item-details" style="margin-top: 5px;">
-                            <span class="item-badge" style="background: #1a4d2e;">⏱️ Queue: ${queueTime}</span>
-                            <span class="item-badge" style="background: #1a3d5c;">🔄 Translation: ${translationTime}</span>
-                            <span class="item-badge" style="background: #4a1a4d;">⏰ Total: ${totalTime}</span>
-                            ${retryBadge}
-                        </div>
-                    </div>
-                </div>
-            `;
         }
         
-        // Initialize
-        refreshItems();
-        refreshLogs();
-        startAutoRefresh();
-        startCountdown();
+        // Initialize WebSocket
+        initWebSocket();
     </script>
 </body>
 </html>

@@ -101,11 +101,13 @@ The script is configured via environment variables using a `.env` file in the sa
 ## How it Works
 
 1. **Initial Scan**: On startup, the script calls Bazarr API to get the current list of movies and series with missing subtitles.
-2. **Check Subtitles**: For each item, it checks which subtitle languages are missing and if existing subtitles can be translated.
-3. **Queue Translation**: Translation requests are added to a queue and processed by worker threads.
-4. **Continuous Scanning**: The scanner runs independently every `INTERVAL_BETWEEN_SCANS` seconds, checking for new content.
-5. **Priority Processing**: When new items are detected in subsequent scans, they're added to the front of the queue for faster processing.
-6. **Concurrent Operation**: Translation workers process the queue continuously while the scanner keeps checking for new items in the background.
+2. **State Restoration**: Failed translation items from previous runs are restored from persistent storage.
+3. **Check Subtitles**: For each item, it checks which subtitle languages are missing and if existing subtitles can be translated.
+4. **Queue Translation**: Translation requests are added to a queue and processed by worker threads.
+5. **Continuous Scanning**: The scanner runs independently every `INTERVAL_BETWEEN_SCANS` seconds, checking for new content.
+6. **Priority Processing**: When new items are detected in subsequent scans, they're added to the front of the queue for faster processing.
+7. **Concurrent Operation**: Translation workers process the queue continuously while the scanner keeps checking for new items in the background.
+8. **State Persistence**: Failed items are saved to `/config/queue_state*.json` and can be retried manually via the web interface.
 
 ---
 
@@ -149,19 +151,26 @@ services:
         ports:
             - "6700:6700"  # Web UI port
         volumes:
-            # if logs are wanted 
+            # Logs directory (optional)
             - ./logs:/usr/src/app/logs
+            # Config directory for persistent state (recommended)
+            - ./config:/config
 ```
+
+> **Note:** The `/config` volume is recommended to persist queue state across container restarts. This allows the application to remember failed translation items and prevents re-processing items unnecessarily.
 
 ## Web Interface
 
 The application includes a web interface for real-time monitoring and control of translation queues.
 
 **Features:**
-- View all items in the queue(s) in real-time
+- View all items in the queue(s) in real-time with color-coded status badges
+- Items displayed by state: Processing (orange) → Queued (blue) → Completed (green) → Failed (red)
 - See series and movies queues side-by-side (when dual queue mode is enabled)
 - Force a manual scan at any time
 - Move items to the top of the queue for priority processing
+- Retry failed translations with a single click
+- View translation timing statistics (queue time, translation time, total time)
 - Auto-refresh every 5 seconds (can be toggled off)
 
 **Access:** Open your browser to `http://localhost:6700` (or the port configured via `WEB_UI_PORT`)
