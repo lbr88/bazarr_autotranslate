@@ -42,7 +42,7 @@ translation_request_timeout = int(get_env_or_default("TRANSLATION_REQUEST_TIMEOU
 num_workers = int(get_env_or_default("NUM_WORKERS", 1))
 interval_between_scans = int(get_env_or_default("INTERVAL_BETWEEN_SCANS", 5 * 60))
 log_level = get_env_or_default("LOG_LEVEL", "INFO")
-log_directory = get_env_or_default("LOG_DIRECTORY", "logs/")
+log_directory = get_env_or_default("LOG_DIRECTORY", "")
 series_scan = bool(get_env_or_default("SERIES_SCAN", True))
 movies_scan = bool(get_env_or_default("MOVIES_SCAN", True))
 
@@ -56,6 +56,7 @@ async def get_episodes_metadata(
     api_key: str,
     series_ids: Optional[List[int]] = None,
     episode_ids: Optional[List[int]] = None,
+    batch_size: int = 50,
 ) -> List[Serie] | None:
     """
     Get metadata for episodes/series
@@ -65,28 +66,56 @@ async def get_episodes_metadata(
         api_key (str): API key for authentication
         series_ids (list[int], optional): List of series IDs to get metadata for
         episode_ids (list[int], optional): List of episode IDs to get metadata for
+        batch_size (int): Number of IDs to process per request (default: 50)
     """
 
-    logger.debug(f"Getting metadata for series: {series_ids}, episodes: {episode_ids}")
+    # Determine which list to batch
+    ids_to_batch = episode_ids if episode_ids else series_ids
+    id_param_key = "episodeid[]" if episode_ids else "seriesid[]"
+    
+    if not ids_to_batch:
+        logger.debug("No episode/series IDs provided")
+        return None
+    
+    logger.info(f"Getting metadata for {len(ids_to_batch)} episodes/series in batches of {batch_size}")
     endpoint = f"{base_url}/api/episodes"
     headers = {"X-API-KEY": api_key}
-
-    params = {}
-    if series_ids:
-        params["seriesid[]"] = series_ids
-    if episode_ids:
-        params["episodeid[]"] = episode_ids
-
+    
+    all_results = []
+    total_batches = (len(ids_to_batch) + batch_size - 1) // batch_size
+    
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(endpoint, headers=headers, params=params)
-            response.raise_for_status()
-            json = response.json()["data"]
+            # Process in batches to avoid URL length limits
+            for i in range(0, len(ids_to_batch), batch_size):
+                batch = ids_to_batch[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                logger.info(f"Fetching episodes metadata batch {batch_num}/{total_batches} ({len(batch)} items)")
+                
+                params = {id_param_key: batch}
+                
+                response = await client.get(endpoint, headers=headers, params=params)
+                response.raise_for_status()
+                json = response.json()["data"]
+                
+                logger.info(f"Received {len(json)} episodes in batch {batch_num}/{total_batches}")
+                
+                # Parse each episode individually to handle errors gracefully
+                for episode_data in json:
+                    try:
+                        episode = Serie.from_dict(episode_data)
+                        all_results.append(episode)
+                    except Exception as parse_error:
+                        episode_title = episode_data.get('title', 'Unknown')
+                        episode_id = episode_data.get('sonarrEpisodeId', 'Unknown')
+                        logger.debug(f"Failed to parse episode '{episode_title}' (ID: {episode_id}): {type(parse_error).__name__}: {str(parse_error)}")
+                        continue
             
-            logger.debug(f"received: {json}")
-            return [Serie.from_dict(obj) for obj in json]
+            logger.info(f"Successfully fetched metadata for {len(all_results)} episodes/series total")
+            return all_results
     except Exception as e:
-        logger.error(f"Error while getting metada: {e}")
+        logger.error(f"Error while getting metada: {e}", exc_info=True)
+        return None
 
 async def get_wanted_episodes(
     base_url: str,
@@ -125,6 +154,7 @@ async def get_movies_metadata(
     base_url: str,
     api_key: str,
     movie_ids: Optional[List[int]] = None,
+    batch_size: int = 50,
 ) -> List[Movie] | None:
     """
     Get metadata for movies
@@ -133,26 +163,52 @@ async def get_movies_metadata(
         base_url (str): Base URL of Bazarr API
         api_key (str): API key for authentication
         movie_ids (list[int], optional): List of movie IDs to get metadata for
+        batch_size (int): Number of IDs to process per request (default: 50)
     """
 
-    logger.debug(f"Getting metada for moveis: {movie_ids}")
+    if not movie_ids:
+        logger.debug("No movie IDs provided")
+        return None
+    
+    logger.info(f"Getting metadata for {len(movie_ids)} movies in batches of {batch_size}")
     endpoint = f"{base_url}/api/movies"
     headers = {"X-API-KEY": api_key}
-    params = {}
-
-    if movie_ids:
-        params["radarrid[]"] = movie_ids
+    
+    all_results = []
+    total_batches = (len(movie_ids) + batch_size - 1) // batch_size
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(endpoint, headers=headers, params=params)
-            response.raise_for_status()
-            json = response.json()["data"]
+            # Process in batches to avoid URL length limits
+            for i in range(0, len(movie_ids), batch_size):
+                batch = movie_ids[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                logger.info(f"Fetching movies metadata batch {batch_num}/{total_batches} ({len(batch)} items)")
+                
+                params = {"radarrid[]": batch}
+                
+                response = await client.get(endpoint, headers=headers, params=params)
+                response.raise_for_status()
+                json = response.json()["data"]
+                
+                logger.info(f"Received {len(json)} movies in batch {batch_num}/{total_batches}")
+                
+                # Parse each movie individually to handle errors gracefully
+                for movie_data in json:
+                    try:
+                        movie = Movie.from_dict(movie_data)
+                        all_results.append(movie)
+                    except Exception as parse_error:
+                        movie_title = movie_data.get('title', 'Unknown')
+                        movie_id = movie_data.get('radarrId', 'Unknown')
+                        logger.debug(f"Failed to parse movie '{movie_title}' (ID: {movie_id}): {type(parse_error).__name__}: {str(parse_error)}")
+                        continue
             
-            logger.debug(f"received: {json}")
-            return [Movie.from_dict(obj) for obj in json]
+            logger.info(f"Successfully fetched metadata for {len(all_results)} movies total")
+            return all_results
     except Exception as e:
-        logger.error(f"Error while getting movies metada: {e}")
+        logger.error(f"Error while getting movies metada: {e}", exc_info=True)
+        return None
 
 async def get_wanted_movies(
     base_url: str,
@@ -228,7 +284,12 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
     subtitles_to_translate = []
     for video_id, language in video_id_language_map.items():
         # Get the video associated
-        video = video_id_to_video_map[video_id]
+        video = video_id_to_video_map.get(video_id)
+        
+        # Skip if video wasn't found in metadata (could be due to parsing error)
+        if video is None:
+            logger.debug(f"skipping video: {video_id} not found in metadata (may have failed to parse)")
+            continue
 
         # Check if there is subtitles
         if video.subtitles is None:
@@ -237,6 +298,10 @@ async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, 
 
         found = False
         for sub in video.subtitles:
+            # Skip subtitles without a valid path
+            if sub.path is None:
+                continue
+                
             if language == sub.code2:
                 continue # Skip metadata for subtitle if it's in the same language to for the translation
                 # I don't think this should happen but better safe than sorry
@@ -383,11 +448,17 @@ if __name__ == "__main__":
 
     # Setup logger
     logger.propagate = False
-    trailing_slash = "/" if not log_directory.endswith("/") else ""
-    os.makedirs(log_directory, exist_ok=True)
-    handler = TimedRotatingFileHandler(
-        f"{log_directory}{trailing_slash}bazarr_lingarr_autotranslate.log", when="midnight", interval=1, backupCount=4
-    )
+    
+    # Use file logging if LOG_DIRECTORY is specified, otherwise log to stdout
+    if log_directory:
+        trailing_slash = "/" if not log_directory.endswith("/") else ""
+        os.makedirs(log_directory, exist_ok=True)
+        handler = TimedRotatingFileHandler(
+            f"{log_directory}{trailing_slash}bazarr_lingarr_autotranslate.log", when="midnight", interval=1, backupCount=4
+        )
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+    
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)

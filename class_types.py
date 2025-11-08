@@ -23,12 +23,24 @@ def from_none(x: Any) -> Any:
     return x
 
 def from_union(fs, x):
+    # Handle empty list as None for optional list fields
+    if isinstance(x, list) and len(x) == 0:
+        for f in fs:
+            try:
+                result = f(None)
+                if result is None:
+                    return None
+            except:
+                pass
+    
+    errors = []
     for f in fs:
         try:
             return f(x)
-        except:
-            pass
-    assert False
+        except Exception as e:
+            errors.append(f"{f.__name__ if hasattr(f, '__name__') else str(f)}: {e}")
+    
+    raise ValueError(f"Could not parse value {repr(x)[:100]} with any converter. Tried: {', '.join(errors)}")
 
 def to_class(c: Type[T], x: Any) -> dict:
     assert isinstance(x, c)
@@ -76,12 +88,12 @@ class Subtitle:
     name: str
     code2: str
     code3: str
-    path: str
+    path: Optional[str]
     forced: bool
     hi: bool
-    file_size: int
+    file_size: Optional[int]
 
-    def __init__(self, name: str, code2: str, code3: str, path: str, forced: bool, hi: bool, file_size: int) -> None:
+    def __init__(self, name: str, code2: str, code3: str, path: Optional[str], forced: bool, hi: bool, file_size: Optional[int]) -> None:
         self.name = name
         self.code2 = code2
         self.code3 = code3
@@ -96,10 +108,10 @@ class Subtitle:
         name = from_str(obj.get("name"))
         code2 = from_str(obj.get("code2"))
         code3 = from_str(obj.get("code3"))
-        path = from_str(obj.get("path"))
+        path = from_union([from_str, from_none], obj.get("path"))
         forced = from_bool(obj.get("forced"))
         hi = from_bool(obj.get("hi"))
-        file_size = from_int(obj.get("file_size"))
+        file_size = from_union([from_int, from_none], obj.get("file_size"))
         return Subtitle(name, code2, code3, path, forced, hi, file_size)
 
     def to_dict(self) -> dict:
@@ -107,10 +119,16 @@ class Subtitle:
         result["name"] = from_str(self.name)
         result["code2"] = from_str(self.code2)
         result["code3"] = from_str(self.code3)
-        result["path"] = from_str(self.path)
+        if self.path is not None:
+            result["path"] = from_str(self.path)
+        else:
+            result["path"] = None
         result["forced"] = from_bool(self.forced)
         result["hi"] = from_bool(self.hi)
-        result["file_size"] = from_int(self.file_size)
+        if self.file_size is not None:
+            result["file_size"] = from_int(self.file_size)
+        else:
+            result["file_size"] = None
         return result
 
 
