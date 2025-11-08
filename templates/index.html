@@ -69,6 +69,30 @@
             transform: translateY(0);
         }
         
+        .priority-btn {
+            background: #ff8c00;
+            color: #000;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 1em;
+            transition: all 0.2s;
+            white-space: nowrap;
+            line-height: 1;
+            min-width: 32px;
+        }
+        
+        .priority-btn:hover {
+            background: #ffa500;
+            transform: scale(1.1);
+        }
+        
+        .priority-btn:active {
+            transform: scale(0.95);
+        }
+        
         .refresh-toggle {
             display: flex;
             align-items: center;
@@ -112,6 +136,19 @@
         .queue-title {
             font-size: 1.5em;
             color: #00d9ff;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .count-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.7em;
+            font-weight: bold;
+            color: #fff;
         }
         
         .queue-count {
@@ -438,7 +475,12 @@
             return counts;
         }
         
-        function renderItem(item) {
+        function renderItem(item, queueType) {
+            // Debug: log the first few items to see structure
+            if (Math.random() < 0.05) {
+                console.log('[DEBUG] Item data:', item);
+            }
+            
             const stateEmojis = {
                 queued: '🟦',
                 processing: '⚙️',
@@ -457,20 +499,28 @@
             
             const emoji = stateEmojis[item.state] || '❓';
             const color = stateColors[item.state] || '#666';
-            const title = item.video_title || 'Unknown';
-            const lang = item.to_language || '??';
+            const title = item.video_title || item.title || 'Unknown';
+            const fromLang = item.from_language || '??';
+            const toLang = item.to_language || '??';
             const retryInfo = item.retry_count > 0 ? ` (retry ${item.retry_count})` : '';
+            
+            // Show priority button only for queued items
+            const priorityButton = item.state === 'queued' && item.queue_position !== undefined 
+                ? `<button onclick="moveToTop('${queueType}', ${item.queue_position})" class="priority-btn" title="Move to top of queue">⬆️</button>` 
+                : '';
             
             return `
                 <div class="queue-item" style="border-left: 4px solid ${color};">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <span style="font-size: 1.2em; margin-right: 8px;">${emoji}</span>
-                            <strong>${title}</strong>
-                            <span style="color: #888; margin-left: 8px;">→ ${lang}</span>
-                            ${retryInfo}
+                    <div style="flex: 1;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 1.2em;">${emoji}</span>
+                            <strong style="flex: 1;">${title}</strong>
+                            ${priorityButton}
                         </div>
-                        <span style="color: ${color}; font-weight: bold;">${item.state.toUpperCase()}</span>
+                        <div style="margin-left: 32px; margin-top: 4px; font-size: 0.9em;">
+                            <span style="color: #888;">${fromLang} → ${toLang}</span>
+                            ${retryInfo ? `<span style="color: #ffcc00; margin-left: 8px;">${retryInfo}</span>` : ''}
+                        </div>
                     </div>
                 </div>
             `;
@@ -488,7 +538,7 @@
                 const seriesCounts = countItemsByState(seriesItems || []);
                 updateQueueHeader('series', seriesCounts);
                 seriesEl.innerHTML = (seriesItems && seriesItems.length > 0) 
-                    ? seriesItems.map(renderItem).join('') 
+                    ? seriesItems.map(item => renderItem(item, 'series')).join('') 
                     : '<div class="empty-queue">No series items</div>';
                 console.log('[UI] Series updated, innerHTML length:', seriesEl.innerHTML.length);
             } else {
@@ -502,7 +552,7 @@
                 const moviesCounts = countItemsByState(moviesItems || []);
                 updateQueueHeader('movies', moviesCounts);
                 moviesEl.innerHTML = (moviesItems && moviesItems.length > 0)
-                    ? moviesItems.map(renderItem).join('')
+                    ? moviesItems.map(item => renderItem(item, 'movies')).join('')
                     : '<div class="empty-queue">No movie items</div>';
                 console.log('[UI] Movies updated, innerHTML length:', moviesEl.innerHTML.length);
             } else {
@@ -517,14 +567,18 @@
                 const counts = countItemsByState(items || []);
                 updateQueueHeader('combined', counts);
                 itemsEl.innerHTML = (items && items.length > 0)
-                    ? items.map(renderItem).join('')
+                    ? items.map(item => renderItem(item, 'combined')).join('')
                     : '<div class="empty-queue">No items yet</div>';
             }
         }
         
         function updateQueueHeader(queueType, counts) {
             const headerEl = document.getElementById(`${queueType}Header`);
-            if (!headerEl) return;
+            console.log(`[Header] Updating ${queueType} header:`, counts, 'Element:', headerEl);
+            if (!headerEl) {
+                console.error(`[Header] ${queueType}Header element not found!`);
+                return;
+            }
             
             const total = counts.processing + counts.queued + counts.retrying + counts.completed + counts.failed;
             const title = queueType === 'series' ? '📺 Series Queue' : 
@@ -538,6 +592,7 @@
                 <span class="count-badge" style="background: #00884d;">✅ ${counts.completed}</span>
                 <span class="count-badge" style="background: #ff0000;">❌ ${counts.failed}</span>
             `;
+            console.log(`[Header] Updated ${queueType} header HTML`);
         }
         
         async function triggerScan(type = 'all') {
@@ -559,12 +614,15 @@
             }
         }
         
-        async function moveToTop(queueType, index) {
+        async function moveToTop(itemKey, queuePosition) {
             try {
+                // Determine queue type from dual queue mode
+                const queueType = dualQueueMode ? (itemKey.includes('serie') ? 'series' : 'movies') : 'combined';
+                
                 const response = await fetch('/api/move-to-top', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ queue_type: queueType, index: index })
+                    body: JSON.stringify({ queue_type: queueType, index: queuePosition })
                 });
                 const data = await response.json();
                 

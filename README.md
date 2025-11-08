@@ -68,6 +68,9 @@ The script is configured via environment variables using a `.env` file in the sa
 | `LOG_DIRECTORY`              | Directory where logs will be saved. Will be created if it doesn't exist.                         | `logs/`         |
 | `SERIES_SCAN`                 | Whether to scan TV series for missing subtitles (`true` or `false`).                             | true            |
 | `MOVIES_SCAN`                 | Whether to scan movies for missing subtitles (`true` or `false`).                                | true            |
+| `LINGARR_URL`                 | Full URL to your Lingarr instance (e.g., `http://localhost:9090`). Required for duplicate detection. | (optional)      |
+| `LINGARR_CHECK_INTERVAL`      | Interval (in seconds) to check Lingarr for duplicate translation requests and cancel them.       | 30              |
+| `LINGARR_CLEAR_QUEUE_ON_STARTUP` | Cancel all active Lingarr translations when the script starts (`true` or `false`).             | false           |
 
 ---
 
@@ -123,6 +126,19 @@ For lingarr to do the translation, make sure to have lingarr setup correctly in 
 `Settings -> Subtitles -> Translating`
 
 ![Lingarr translation settings in bazarr](assets/lingarr_settings.png)
+
+### Duplicate Detection
+
+If you set `LINGARR_URL`, the script will periodically check Lingarr for duplicate translation requests (which can happen when Bazarr retries failed requests). When duplicates are found, only the oldest request is kept and newer duplicates are automatically cancelled. This prevents wasted processing and ensures efficient translation.
+
+**Example:**
+```bash
+LINGARR_URL=http://lingarr:9090
+LINGARR_CHECK_INTERVAL=30              # Check every 30 seconds
+LINGARR_CLEAR_QUEUE_ON_STARTUP=true    # Optional: clear all pending translations on startup
+```
+
+When `LINGARR_CLEAR_QUEUE_ON_STARTUP=true`, all translation requests in Lingarr (Pending, InProgress, Failed, Cancelled, and Completed) will be removed when the script starts. This is useful if you want a completely clean slate on restart.
 
 ## Translated Subtitle Upgrade
 

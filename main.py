@@ -53,6 +53,9 @@ series_scan = bool(get_env_or_default("SERIES_SCAN", True))
 movies_scan = bool(get_env_or_default("MOVIES_SCAN", True))
 max_retries = int(get_env_or_default("MAX_RETRIES", 3))
 min_translation_time = float(get_env_or_default("MIN_TRANSLATION_TIME", 10.0))  # Minimum expected translation time in seconds
+lingarr_url = os.getenv("LINGARR_URL", "").rstrip("/")
+lingarr_check_interval = int(get_env_or_default("LINGARR_CHECK_INTERVAL", 30))  # Check for duplicates every N seconds
+lingarr_clear_queue_on_startup = os.getenv("LINGARR_CLEAR_QUEUE_ON_STARTUP", "false").lower() in ("true", "1", "yes")
 
 # Create queue managers based on dual_queue_mode
 if dual_queue_mode:
@@ -81,6 +84,192 @@ manual_scan_event = asyncio.Event()
 manual_scan_series_event = asyncio.Event()
 manual_scan_movies_event = asyncio.Event()
 logger = logging.getLogger("bazarr_lingarr")
+
+async def get_lingarr_active_translations():
+    """Get all active translation requests from Lingarr."""
+    if not lingarr_url:
+        return []
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get all translation requests with a large page size to catch everything
+            response = await client.get(
+                f"{lingarr_url}/api/TranslationRequest/requests",
+                params={"pageSize": 1000, "pageNumber": 1}
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            # Filter for active translations (Pending or InProgress)
+            active = [
+                item for item in data.get("items", [])
+                if item.get("status") in ["Pending", "InProgress"]
+            ]
+            
+            logger.debug(f"Found {len(active)} active translation requests in Lingarr")
+            return active
+    except Exception as e:
+        logger.warning(f"Failed to get Lingarr translation requests: {e}")
+        return []
+
+async def cancel_lingarr_translation(translation_request):
+    """Cancel a translation request in Lingarr."""
+    if not lingarr_url:
+        return False
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{lingarr_url}/api/TranslationRequest/cancel",
+                json=translation_request
+            )
+            response.raise_for_status()
+            return True
+    except Exception as e:
+        logger.error(f"Failed to cancel Lingarr translation request {translation_request.get('id')}: {e}")
+        return False
+
+async def remove_lingarr_translation(translation_request):
+    """Remove a translation request from Lingarr."""
+    if not lingarr_url:
+        return False
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{lingarr_url}/api/TranslationRequest/remove",
+                json=translation_request
+            )
+            response.raise_for_status()
+            return True
+    except Exception as e:
+        logger.error(f"Failed to remove Lingarr translation request {translation_request.get('id')}: {e}")
+        return False
+
+async def clear_lingarr_queue():
+    """Remove all translation requests (active, failed, cancelled) from Lingarr."""
+    if not lingarr_url:
+        return
+    
+    logger.info("Clearing Lingarr queue on startup...")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Fetch all pages of translation requests
+            all_translations = []
+            page_number = 1
+            page_size = 100
+            
+            while True:
+                response = await client.get(
+                    f"{lingarr_url}/api/TranslationRequest/requests",
+                    params={"pageSize": page_size, "pageNumber": page_number}
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                items = data.get("items", [])
+                if not items:
+                    break
+                
+                all_translations.extend(items)
+                total_count = data.get("totalCount", 0)
+                
+                logger.info(f"Fetched page {page_number}: {len(items)} items (total so far: {len(all_translations)}/{total_count})")
+                
+                # Check if we've fetched everything
+                if len(all_translations) >= total_count:
+                    break
+                
+                page_number += 1
+            
+            if not all_translations:
+                logger.info("Lingarr queue is already empty")
+                return
+            
+            logger.info(f"Found {len(all_translations)} translation request(s) to remove")
+            removed_count = 0
+            
+            for trans in all_translations:
+                title = trans.get("title", "Unknown")
+                trans_id = trans.get("id")
+                status = trans.get("status", "Unknown")
+                logger.debug(f"  Removing: {title} (ID: {trans_id}, Status: {status})")
+                
+                # Cancel first if active, then remove
+                if status in ["Pending", "InProgress"]:
+                    await cancel_lingarr_translation(trans)
+                
+                if await remove_lingarr_translation(trans):
+                    removed_count += 1
+            
+            logger.info(f"Removed {removed_count}/{len(all_translations)} translation(s) from Lingarr queue")
+    except Exception as e:
+        logger.error(f"Failed to clear Lingarr queue: {e}")
+
+async def cleanup_duplicate_lingarr_translations():
+    """Find and cancel duplicate translation requests in Lingarr, keeping only the oldest one per unique subtitle+language combo."""
+    if not lingarr_url:
+        return
+    
+    active_translations = await get_lingarr_active_translations()
+    if not active_translations:
+        return
+    
+    # Group by subtitle path + target language
+    groups = {}
+    for trans in active_translations:
+        subtitle_path = trans.get("subtitleToTranslate", "")
+        target_lang = trans.get("targetLanguage", "")
+        key = f"{subtitle_path}|{target_lang}"
+        
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(trans)
+    
+    # Find duplicates and cancel newer ones
+    cancelled_count = 0
+    for key, translations in groups.items():
+        if len(translations) <= 1:
+            continue
+        
+        # Sort by creation time (oldest first)
+        translations.sort(key=lambda x: x.get("createdAt", ""))
+        
+        # Keep the oldest, cancel the rest
+        oldest = translations[0]
+        duplicates = translations[1:]
+        
+        logger.info(f"Found {len(duplicates)} duplicate translation(s) for {oldest.get('title', 'Unknown')} ({oldest.get('targetLanguage', '')})")
+        
+        for dup in duplicates:
+            logger.info(f"  Cancelling duplicate translation ID {dup.get('id')} (created at {dup.get('createdAt')})")
+            if await cancel_lingarr_translation(dup):
+                cancelled_count += 1
+    
+    if cancelled_count > 0:
+        logger.info(f"Cancelled {cancelled_count} duplicate translation request(s) in Lingarr")
+
+async def lingarr_cleanup_loop():
+    """Background loop that periodically checks and cancels duplicate translations in Lingarr."""
+    if not lingarr_url:
+        logger.info("Lingarr duplicate cleanup disabled (LINGARR_URL not set)")
+        return
+    
+    logger.info(f"Starting Lingarr duplicate cleanup loop (checking every {lingarr_check_interval}s)")
+    
+    while not shutdown_event.is_set():
+        try:
+            await cleanup_duplicate_lingarr_translations()
+        except Exception as e:
+            logger.error(f"Error in Lingarr cleanup loop: {e}")
+        
+        # Wait for interval or shutdown
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=lingarr_check_interval)
+            break  # Shutdown event was set
+        except asyncio.TimeoutError:
+            pass  # Normal timeout, continue loop
 
 async def get_episodes_metadata(
     base_url: str,
@@ -274,100 +463,110 @@ async def get_wanted_movies(
         logger.error(f"Error while getting metada for movies: {e}")
 
 async def find_base_language_subtitles_from_missing_sutitles(base_url, api_key, videos: List[Serie] | List[Movie], batch_size: int = 50, priority: bool = False) -> int:
-    """Process missing subtitles and add them to queue during fetch. Returns count of items added."""
-    # Making a video id to language map, useful later on
+    """Process missing subtitles and add them to queue IMMEDIATELY as they're found. Returns count of items added."""
+    # Build video id to language map AND preserve original video data for titles
     video_id_language_map = {}
+    video_id_to_original = {}  # Store original video objects with their titles
+    
     for video in videos:
-        # Get video id from correct property depending the video instance
         video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
         for missing_sub in video.missing_subtitles:
-            # Validate language code
             if not is_valid_language_code(missing_sub.code2):
-                logger.warning(f"Invalid language code '{missing_sub.code2}' found in missing subtitles for video {video_id}. Skipping. This may be a Bazarr data issue.")
+                logger.warning(f"Invalid language code '{missing_sub.code2}' found in missing subtitles for video {video_id}. Skipping.")
                 continue
                 
-            # Check if the missing subtitle is in the list for language to be translated in
             if missing_sub.code2 in to_languges:
-                # QueueManager handles deduplication internally, so just add to map
                 video_id_language_map[video_id] = missing_sub.code2
+                video_id_to_original[video_id] = video  # Store original with title data
 
     if len(video_id_language_map) == 0:
         logger.info("No missing subtitles found that is in list of languages to be translated")
         return 0
 
-    metadata: List[Serie] | List[Movie] | None = None
-    if isinstance(videos[0], Serie):
-        metadata = await get_episodes_metadata(
-            base_url, api_key, episode_ids=list(video_id_language_map.keys()), batch_size=batch_size
-        )
-    else:
-        metadata = await get_movies_metadata(base_url, api_key, movie_ids=list(video_id_language_map.keys()), batch_size=batch_size)
-
-    if metadata is None:
-        logger.info("No metadata returned, couldn't find already existing subtitles")
-        return 0
-    
-    video_id_to_video_map: dict[int, Serie | Movie] = {}
-    for video in metadata:
-        video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
-        video_id_to_video_map[video_id] = video
-    
     # Determine which queue manager to use
+    is_series = isinstance(videos[0], Serie)
     if dual_queue_mode:
-        qm = queue_manager_series if isinstance(videos[0], Serie) else queue_manager_movies
+        qm = queue_manager_series if is_series else queue_manager_movies
     else:
         qm = queue_manager
-    
-    # Check the metadata for already existing subtitles and add them to queue immediately
+
+    # Fetch metadata in batches and process IMMEDIATELY
+    ids_to_fetch = list(video_id_language_map.keys())
     items_added = 0
-    for video_id, language in video_id_language_map.items():
-        # Get the video associated
-        video = video_id_to_video_map.get(video_id)
+    
+    logger.debug(f"Fetching metadata for {len(ids_to_fetch)} items in batches of {batch_size}")
+    
+    # Process in batches - add to queue as soon as each batch is fetched
+    for batch_start in range(0, len(ids_to_fetch), batch_size):
+        batch_ids = ids_to_fetch[batch_start:batch_start + batch_size]
+        batch_num = batch_start // batch_size + 1
+        total_batches = (len(ids_to_fetch) + batch_size - 1) // batch_size
         
-        # Skip if video wasn't found in metadata (could be due to parsing error)
-        if video is None:
-            logger.debug(f"skipping video: {video_id} not found in metadata (may have failed to parse)")
+        logger.debug(f"Processing batch {batch_num}/{total_batches} ({len(batch_ids)} items)")
+        
+        # Fetch this batch
+        if is_series:
+            batch_metadata = await get_episodes_metadata(base_url, api_key, episode_ids=batch_ids, batch_size=len(batch_ids))
+        else:
+            batch_metadata = await get_movies_metadata(base_url, api_key, movie_ids=batch_ids, batch_size=len(batch_ids))
+        
+        if batch_metadata is None:
+            logger.warning(f"Batch {batch_num} returned no metadata")
             continue
-
-        # Check if there is subtitles
-        if video.subtitles is None:
-            logger.debug(f"skipping video: {video_id} no current existing subtitles found")
-            continue
-
-        for sub in video.subtitles:
-            # Skip subtitles without a valid path
-            if sub.path is None:
+        
+        # Process this batch IMMEDIATELY - add matching items to queue
+        for video in batch_metadata:
+            video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
+            target_language = video_id_language_map.get(video_id)
+            
+            if target_language is None:
                 continue
-                
-            if language == sub.code2:
-                continue # Skip metadata for subtitle if it's in the same language to for the translation
-
-            # Validate the language code before processing
-            if not is_valid_language_code(sub.code2):
-                logger.warning(f"Invalid language code '{sub.code2}' found for subtitle '{sub.name}' on video {video_id}. Skipping. This may be a Bazarr data issue.")
+            
+            if video.subtitles is None:
+                logger.debug(f"Video {video_id} has no existing subtitles")
                 continue
 
-            # If the subtitle is in the base language list, add it to queue immediately
-            if sub.code2 in base_languages:
-                # Get video title
-                if isinstance(video, Serie):
-                    # Build series title from available fields
-                    series_name = video.series_title or video.title or f"Series {video.sonarr_series_id}"
-                    episode_num = video.episode_number or "??"
-                    episode_name = video.episode_title or "Unknown Episode"
-                    video_title = f"{series_name} - {episode_num} - {episode_name}"
-                else:
-                    video_title = video.title if hasattr(video, 'title') and video.title else f"Movie {video.radarr_id}"
+            # Find base language subtitle and add to queue immediately
+            for sub in video.subtitles:
+                if sub.path is None:
+                    continue
+                    
+                if target_language == sub.code2:
+                    continue  # Skip if same language as target
                 
-                subtitle_item = SubtitleTranslate(sub, language, video_id, isinstance(video, Serie), video_title)
-                qm.add_item(subtitle_item, priority=priority)
-                items_added += 1
-                break
+                if not is_valid_language_code(sub.code2):
+                    logger.warning(f"Invalid language code '{sub.code2}' for subtitle on video {video_id}. Skipping.")
+                    continue
+
+                # Found a base language subtitle - add it NOW
+                if sub.code2 in base_languages:
+                    # Get original video data for proper title
+                    original_video = video_id_to_original.get(video_id)
+                    
+                    # Build video title from WANTED episodes data (has full metadata)
+                    if isinstance(video, Serie) and original_video:
+                        series_name = original_video.series_title or f"Series {original_video.sonarr_series_id}"
+                        episode_num = original_video.episode_number or "?x?"
+                        episode_name = original_video.episode_title or "Unknown"
+                        video_title = f"{series_name} {episode_num} - {episode_name}"
+                    elif original_video and hasattr(original_video, 'title'):
+                        video_title = original_video.title or f"Movie {video_id}"
+                    else:
+                        video_title = f"Video {video_id}"
+                    
+                    subtitle_item = SubtitleTranslate(sub, target_language, video_id, is_series, video_title)
+                    # Only increment counter if item was actually added (not a duplicate)
+                    if qm.add_item(subtitle_item, priority=priority):
+                        items_added += 1
+                        logger.debug(f"✓ Added to queue: {video_title} ({sub.code2} → {target_language})")
+                    else:
+                        logger.debug(f"⊘ Skipped duplicate: {video_title} ({sub.code2} → {target_language})")
+                    break  # Only add one base subtitle per video
 
     if items_added == 0:
-        logger.info("No already existing subtitles matched with requested translation subs")
+        logger.info("No existing base language subtitles found for translation")
     else:
-        logger.info(f"Added {items_added} matching subtitles to queue")
+        logger.info(f"✓ Added {items_added} items to queue during scan")
     
     return items_added
 
@@ -458,8 +657,17 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
 
                 start_time = time.time()
                 response = client.patch(endpoint, headers=headers, params=params)
-                response.raise_for_status()
                 translation_time = time.time() - start_time
+                
+                # Log response for debugging
+                if response.status_code != 204:
+                    logger.warning(f"[{worker_label}] Unexpected status code: {response.status_code}")
+                    try:
+                        logger.debug(f"[{worker_label}] Response body: {response.text}")
+                    except:
+                        pass
+                
+                response.raise_for_status()
                 
                 # Check if translation completed suspiciously fast (likely failed)
                 if translation_time < min_translation_time:
@@ -470,7 +678,11 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                     qm.mark_completed(sub, success=True)
                     
             except httpx.HTTPStatusError as e:
-                logger.error(f"[{worker_label}] HTTP error translating {sub.base_subtitle.path if sub else 'unknown'}: {e}")
+                logger.error(f"[{worker_label}] HTTP {e.response.status_code} error translating {sub.base_subtitle.path if sub else 'unknown'}: {e}")
+                try:
+                    logger.error(f"[{worker_label}] Error response body: {e.response.text}")
+                except:
+                    pass
                 if sub:
                     qm.mark_completed(sub, success=False)
             except Exception as e:
@@ -621,6 +833,13 @@ async def main(base_url, api_key):
         logger.info(f"Starting {num_workers} translation worker(s) (single queue mode)")
         for i in range(num_workers):
             threading.Thread(target=translation_worker, args=(i, base_url, api_key, "combined"), daemon=True).start()
+    
+    # Clear Lingarr queue if requested
+    if lingarr_clear_queue_on_startup:
+        await clear_lingarr_queue()
+    
+    # Start Lingarr duplicate cleanup task
+    lingarr_cleanup_task = asyncio.create_task(lingarr_cleanup_loop())
     
     # Run scanner task concurrently (it runs independently and continuously)
     logger.info(f"Starting scanner task (interval: {interval_between_scans}s)")
