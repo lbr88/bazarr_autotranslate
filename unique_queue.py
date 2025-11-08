@@ -9,11 +9,15 @@ class UniqueQueue:
         self.not_empty = threading.Condition(self.lock)
         self.key_fn = key_fn
 
-    def put(self, item):
+    def put(self, item, priority=False):
+        """Add item to queue. If priority=True, add to front of queue."""
         key = self.key_fn(item)
         with self.lock:
             if key not in self.seen:
-                self.q.append(item)
+                if priority:
+                    self.q.appendleft(item)
+                else:
+                    self.q.append(item)
                 self.seen.add(key)
                 self.not_empty.notify()
 
@@ -37,3 +41,13 @@ class UniqueQueue:
         key = self.key_fn(item)
         with self.lock:
             return key in self.seen
+    
+    def qsize(self):
+        """Return approximate size of queue."""
+        with self.lock:
+            return len(self.q)
+    
+    def peek(self, n=5):
+        """Return the first n items in the queue without removing them."""
+        with self.lock:
+            return list(self.q)[:n]

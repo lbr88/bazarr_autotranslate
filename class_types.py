@@ -251,17 +251,20 @@ class SubtitleTranslate:
     to_language: str
     video_id: int
     is_serie: bool
+    video_title: str
 
-    def __init__(self, base_subtitle: Subtitle, to_language: str, video_id: int, is_serie: bool) -> None:
+    def __init__(self, base_subtitle: Subtitle, to_language: str, video_id: int, is_serie: bool, video_title: str = "Unknown") -> None:
         self.base_subtitle = base_subtitle
         self.to_language = to_language
         self.video_id = video_id
         self.is_serie = is_serie
+        self.video_title = video_title
 
     def to_dict(self):
         return {
             "base_subtitle": self.base_subtitle.to_dict(),
             "to_language": self.to_language,
             "video_id": self.video_id,
-            "is_serie": self.is_serie
+            "is_serie": self.is_serie,
+            "video_title": self.video_title
         }

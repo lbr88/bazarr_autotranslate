@@ -21,6 +21,8 @@ A Python script that automates subtitle translation in Bazarr by leveraging its 
 - Automatically scans movies and series for missing subtitles.
 - Checks if existing subtitles can be translated into the missing language.
 - Queues translation requests using Bazarr API.
+- **Concurrent scanning and processing**: Scanner runs independently from translation workers, allowing new items to be detected while processing continues.
+- **Priority queue for new items**: Newly added content is prioritized and translated first, so users don't wait through the entire backlog.
 - Configurable scanning intervals and worker concurrency.
 - Logs actions and errors for easier monitoring.
 
@@ -57,6 +59,8 @@ The script is configured via environment variables using a `.env` file in the sa
 | `TRANSLATION_REQUEST_TIMEOUT`| Time (in seconds) to wait for the translation to complete or consider it failed (SEE NOTE 2)                    | 900 (15 minutes) |
 | `NUM_WORKERS`                 | Number of worker threads to handle translation queue requests in parallel. That means, How many translation could be processing at the same time                      | 1               |
 | `INTERVAL_BETWEEN_SCANS`     | Interval (in seconds) between each automatic scan of your Bazarr library.                        | 300 (5 minutes) |
+| `BATCH_SIZE`                  | Number of items to fetch per API request when retrieving metadata. Lower values reduce URL length but increase API calls. | 50 |
+| `DUAL_QUEUE`                  | Enable separate queues for series and movies, allowing both to be processed concurrently. Set to `true` to enable. | false |
 | `LOG_LEVEL`                   | Logging level. Options: `DEBUG`, `INFO`, `ERROR`.                                     | INFO            |
 | `LOG_DIRECTORY`              | Directory where logs will be saved. Will be created if it doesn't exist.                         | `logs/`         |
 | `SERIES_SCAN`                 | Whether to scan TV series for missing subtitles (`true` or `false`).                             | true            |
@@ -80,6 +84,9 @@ The script is configured via environment variables using a `.env` file in the sa
 > **Note 4:**
 > If you want lingarr to do the translation check the [Lingarr section](#lingarr)
 
+> **Note 5:**
+> When `DUAL_QUEUE=true`, workers are split between series and movies (minimum 1 each). For example, with `NUM_WORKERS=4`, you'll get 2 series workers and 2 movies workers. This prevents one type from blocking the other in the queue.
+
 ## Usage
 
 1. Set the desired environment variables or use the defaults.  
@@ -90,10 +97,12 @@ The script is configured via environment variables using a `.env` file in the sa
 
 ## How it Works
 
-1. **Scan**: The script calls Bazarr API to get the current list of movies and series.  
-2. **Check Subtitles**: For each item, it checks which subtitle languages are missing.  
-3. **Find Existing Subtitles**: If a subtitle in another language exists, it requests translation of that subtitle into the missing language via Bazarr API.  
-4. **Queue Translation**: Translation requests are queued and processed by Bazarr automatically.
+1. **Initial Scan**: On startup, the script calls Bazarr API to get the current list of movies and series with missing subtitles.
+2. **Check Subtitles**: For each item, it checks which subtitle languages are missing and if existing subtitles can be translated.
+3. **Queue Translation**: Translation requests are added to a queue and processed by worker threads.
+4. **Continuous Scanning**: The scanner runs independently every `INTERVAL_BETWEEN_SCANS` seconds, checking for new content.
+5. **Priority Processing**: When new items are detected in subsequent scans, they're added to the front of the queue for faster processing.
+6. **Concurrent Operation**: Translation workers process the queue continuously while the scanner keeps checking for new items in the background.
 
 ---
 
