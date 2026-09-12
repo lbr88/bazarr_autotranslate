@@ -1,4 +1,10 @@
-__pycache__
+__pycache__/
+*.pyc
 .devcontainer
 .env
-logs
+.env.*
+!.env.example
+logs/
+*.log
+config/
+.git

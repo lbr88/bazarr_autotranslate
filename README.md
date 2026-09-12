@@ -47,7 +47,7 @@ Since Bazarr currently has **no automation features** for translation (the proce
 
 ## Configuration
 
-The script is configured via environment variables using a `.env` file in the same directory. Below is a list of supported variables with their descriptions and default values:
+The script is configured via environment variables using a `.env` file in the same directory (see `.env.example` for placeholders — never commit real secrets). Below is a list of supported variables with their descriptions and default values:
 
 [Docker compose example](#docker-compose-example)
 
@@ -64,6 +64,7 @@ The script is configured via environment variables using a `.env` file in the sa
 | `DUAL_QUEUE`                  | Enable separate queues for series and movies, allowing both to be processed concurrently. Set to `true` to enable. | false |
 | `WEB_UI`                      | Enable the web interface for monitoring and controlling queues. Set to `false` to disable. | true |
 | `WEB_UI_PORT`                 | Port number for the web interface. | 6700 |
+| `FLASK_SECRET_KEY`            | Secret key for Flask/SocketIO sessions. Set a long random value in production (`WEB_UI_SECRET_KEY` also accepted). | `change-me-set-FLASK_SECRET_KEY` |
 | `LOG_LEVEL`                   | Logging level. Options: `DEBUG`, `INFO`, `ERROR`.                                     | INFO            |
 | `LOG_DIRECTORY`              | Directory where logs will be saved. Will be created if it doesn't exist.                         | `logs/`         |
 | `SERIES_SCAN`                 | Whether to scan TV series for missing subtitles (`true` or `false`).                             | true            |

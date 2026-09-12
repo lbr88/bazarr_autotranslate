@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
@@ -7,7 +8,12 @@ from collections import deque
 
 # This will be set by main.py
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'bazarr-autotranslate-secret'
+# Prefer FLASK_SECRET_KEY / WEB_UI_SECRET_KEY from the environment; never hardcode secrets.
+app.config['SECRET_KEY'] = (
+    os.environ.get('FLASK_SECRET_KEY')
+    or os.environ.get('WEB_UI_SECRET_KEY')
+    or 'change-me-set-FLASK_SECRET_KEY'
+)
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 

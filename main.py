@@ -224,12 +224,14 @@ async def cleanup_duplicate_lingarr_translations():
     if not active_translations:
         return
     
-    # Group by subtitle path + target language
+    # Group by source subtitle path + source language + target language
     groups = {}
     for trans in active_translations:
         subtitle_path = trans.get("subtitleToTranslate", "")
+        source_lang = trans.get("sourceLanguage", "")
         target_lang = trans.get("targetLanguage", "")
-        key = f"{subtitle_path}|{target_lang}"
+        # Include source language in the key to avoid false positives
+        key = f"{subtitle_path}|{source_lang}|{target_lang}"
         
         if key not in groups:
             groups[key] = []
@@ -249,7 +251,7 @@ async def cleanup_duplicate_lingarr_translations():
         oldest = translations[0]
         duplicates = translations[1:]
         
-        logger.info(f"Found {len(duplicates)} duplicate translation(s) for {oldest.get('title', 'Unknown')} ({oldest.get('targetLanguage', '')})")
+        logger.info(f"Found {len(duplicates)} duplicate translation(s) for {oldest.get('title', 'Unknown')} ({oldest.get('sourceLanguage', '')} → {oldest.get('targetLanguage', '')})")
         
         for dup in duplicates:
             logger.info(f"  Cancelling and removing duplicate translation ID {dup.get('id')} (created at {dup.get('createdAt')})")
@@ -837,10 +839,21 @@ def translate_via_lingarr_sync(sub: SubtitleTranslate, client: httpx.Client) -> 
                 "subtitleFormat": "srt"
             }
             
+            logger.debug(f"Lingarr translate payload: {payload}")
+            
             response = await async_client.post(
                 f"{lingarr_url}/api/Translate/subtitle",
                 json=payload
             )
+            
+            # Log response details
+            logger.debug(f"Lingarr response status: {response.status_code}")
+            if response.status_code != 200:
+                try:
+                    logger.error(f"Lingarr error response: {response.text}")
+                except:
+                    pass
+            
             response.raise_for_status()
             
             # Response should contain jobId
@@ -848,6 +861,7 @@ def translate_via_lingarr_sync(sub: SubtitleTranslate, client: httpx.Client) -> 
             job_id = data.get("jobId")
             
             if job_id:
+                logger.debug(f"Lingarr job created with ID: {job_id}")
                 return True
             else:
                 raise Exception("No jobId returned from Lingarr")
@@ -896,16 +910,15 @@ def translation_worker(worker_id, base_url, api_key, queue_type="combined"):
                 filename = sub.base_subtitle.path
                 has_lang_code = f".{sub.base_subtitle.code2}." in filename.lower() or filename.lower().endswith(f".{sub.base_subtitle.code2}.srt")
                 
-                # Decide whether to use Lingarr directly or go through Bazarr
-                use_lingarr_direct = not has_lang_code and lingarr_url
+                # For now, always use Bazarr - direct Lingarr translation has issues
+                # TODO: Fix direct Lingarr translation (404 errors)
+                use_lingarr_direct = False  # Disabled until we fix the endpoint/payload
                 
-                if use_lingarr_direct:
-                    logger.info(f"[{worker_label}] Translating via Lingarr (missing language code): {sub.base_subtitle.path} ({sub.base_subtitle.code2} → {sub.to_language})")
-                else:
-                    if not has_lang_code:
-                        logger.warning(f"[{worker_label}] Subtitle file missing language code in filename: {filename}")
-                        logger.warning(f"[{worker_label}] This may cause Lingarr to misdetect source language. Consider renaming to include '.{sub.base_subtitle.code2}.' in filename")
-                    logger.info(f"[{worker_label}] Translating: {sub.base_subtitle.path} ({sub.base_subtitle.code2} → {sub.to_language})")
+                if not has_lang_code:
+                    logger.warning(f"[{worker_label}] Subtitle file missing language code in filename: {filename}")
+                    logger.warning(f"[{worker_label}] This may cause Lingarr to misdetect source language. Consider renaming to include '.{sub.base_subtitle.code2}.' in filename")
+                
+                logger.info(f"[{worker_label}] Translating: {sub.base_subtitle.path} ({sub.base_subtitle.code2} → {sub.to_language})")
 
                 start_time = time.time()
                 

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+</head>
+<body>
+    <h1>WebSocket Test</h1>
+    <div id="status">Initializing...</div>
+    <div id="messages" style="margin-top: 20px; padding: 10px; background: #f0f0f0; max-height: 400px; overflow-y: auto;"></div>
+    
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        const statusEl = document.getElementById('status');
+        const messagesEl = document.getElementById('messages');
+        
+        function log(msg) {
+            console.log(msg);
+            const div = document.createElement('div');
+            div.textContent = new Date().toISOString() + ': ' + msg;
+            messagesEl.appendChild(div);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+        
+        log('Initializing Socket.IO connection...');
+        statusEl.textContent = 'Connecting...';
+        
+        const socket = io({
+            transports: ['websocket', 'polling'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionAttempts: 10
+        });
+        
+        socket.on('connect', () => {
+            log('✓ Connected to WebSocket server');
+            statusEl.textContent = 'Connected ✓';
+            statusEl.style.color = 'green';
+        });
+        
+        socket.on('connect_error', (error) => {
+            log('✗ Connection error: ' + error);
+            statusEl.textContent = 'Connection Error ✗';
+            statusEl.style.color = 'red';
+        });
+        
+        socket.on('disconnect', (reason) => {
+            log('Disconnected: ' + reason);
+            statusEl.textContent = 'Disconnected';
+            statusEl.style.color = 'orange';
+        });
+        
+        socket.on('queue_update', (data) => {
+            log('Received queue_update event with data: ' + JSON.stringify(data).substring(0, 100));
+        });
+        
+        socket.on('error', (error) => {
+            log('✗ Socket error: ' + error);
+        });
+        
+        // Test connection every 5 seconds
+        setInterval(() => {
+            if (socket.connected) {
+                log('Still connected ✓');
+            } else {
+                log('Not connected, attempting reconnect...');
+            }
+        }, 5000);
+    </script>
+</body>
+</html>
